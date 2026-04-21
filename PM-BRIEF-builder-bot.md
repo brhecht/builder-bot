@@ -1,8 +1,8 @@
 # PM Brief — Builder Bot (Daily Recap)
 **App:** builder-bot (new repo)
-**Status:** DRAFT
+**Status:** APPROVED
 **Created:** April 21, 2026
-**Approved:** —
+**Approved:** April 21, 2026
 
 ## What We're Building
 A scheduled Slack bot that posts a daily weekday recap to The New Builder
