@@ -10,11 +10,11 @@ Slack workspace at 9:30am ET. It reads activity across 4 channels since
 the last time each channel was reported on (cumulative, not a fixed 24h
 window), fetches linked content, uses Claude to curate and summarize the
 most engaging and substantive moments, and posts a clean bulleted digest
-as "Builder Bot" in #daily-recap. Goal: re-engage members daily and drive
+as "Builder Bot" in #daily-recap-bot. Goal: re-engage members daily and drive
 click-throughs into active threads.
 
 ## Acceptance Criteria
-- [ ] Builder Bot posts to #daily-recap at 9:30am ET, weekdays only
+- [ ] Builder Bot posts to #daily-recap-bot at 9:30am ET, weekdays only
 - [ ] Each channel's lookback window is cumulative — starts from its own
       last-reported timestamp stored in Vercel KV, not a fixed 24h window
 - [ ] New member intros (from #introduce-yourself) are included in the
@@ -38,7 +38,7 @@ click-throughs into active threads.
 - New standalone repo: builder-bot
 - Vercel deployment + Vercel KV (state storage)
 - Vercel cron: weekdays 9:30am ET (DST-aware via luxon)
-- Slack API: read 4 source channels + post to #daily-recap
+- Slack API: read 4 source channels + post to #daily-recap-bot
 - Claude API: relevance evaluation + summarization
 - URL fetching with graceful fallback
 - Deduplication logic
@@ -59,7 +59,7 @@ click-throughs into active threads.
 | #share-and-discuss | Primary conversation source |
 | #what-im-building | Primary conversation source |
 | #general | Supplemental — only if Claude scores item as notable |
-| #daily-recap | Output only — Builder Bot posts here |
+| #daily-recap-bot-bot | Output only — Builder Bot posts here (channel ID: C0AUS1Q7917) |
 
 ## Post Format (exact — no variations)
 
@@ -165,7 +165,7 @@ then (b) write the final summary for all Include items.
 9. If posting:
    - Combine pending_intros + today's intros into the 👋 section (if any)
    - Combine Claude's Include items into the 💬 section
-   - Post to #daily-recap
+   - Post to #daily-recap-bot
    - Update all `last_reported_{channel_id}` timestamps to now
    - Clear `pending_intros` from KV
 10. If skipping:
@@ -194,11 +194,11 @@ Recommend: luxon time-check inside function + single UTC cron. Cleaner
 than two cron entries.
 
 ## Environment Variables
-| Variable | Source |
-|----------|--------|
-| `SLACK_BOT_TOKEN` | Brian provides to Nico directly — never committed to repo |
-| `ANTHROPIC_API_KEY` | Same key used across B-Suite — Brian provides |
-| `SLACK_DAILY_RECAP_CHANNEL_ID` | Channel ID for #daily-recap (not the name — the ID) |
+| Variable | Value / Source |
+|----------|----------------|
+| `SLACK_BOT_TOKEN` | **Brian will DM you this value** — never commit to repo |
+| `ANTHROPIC_API_KEY` | **Brian will DM you this value** — same key used across B-Suite |
+| `SLACK_DAILY_RECAP_CHANNEL_ID` | `C0AUS1Q7917` (the #daily-recap-bot-bot channel) |
 | `KV_REST_API_URL` | Auto-injected by Vercel when KV store is created |
 | `KV_REST_API_TOKEN` | Auto-injected by Vercel when KV store is created |
 
@@ -229,9 +229,9 @@ with timestamps and message counts.
 ### Milestone 2: Claude Scoring + URL Fetch + Post
 **What:** Claude API wired with exact prompt spec above. URL fetching
 implemented with fallback chain. Deduplication working. Carry-forward
-intro logic working. Bot posts a test message to #daily-recap using
+intro logic working. Bot posts a test message to #daily-recap-bot using
 exact post format.
-**Verify:** Test post visible in #daily-recap with correct format and
+**Verify:** Test post visible in #daily-recap-bot with correct format and
 genuine Claude-generated summaries (not placeholder text).
 **→ Contact Brian via Slack DM with screenshot. Wait for Brian's OK
 before proceeding.**
