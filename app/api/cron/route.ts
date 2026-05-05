@@ -48,14 +48,21 @@ export async function GET(req: NextRequest) {
 
   // DST-aware time check: run only if it's 9:00–10:59 AM New York time
   // Single cron at 14:30 UTC fires at 9:30 AM EST (winter) and 10:30 AM EDT (summer)
+  // ?test=true bypasses time/day gate (requires valid CRON_SECRET)
+  const isTest = req.nextUrl.searchParams.get('test') === 'true'
+  const isDryRun = req.nextUrl.searchParams.get('dry_run') === 'true'
   const now = DateTime.now().setZone('America/New_York')
-  if (now.weekday > 5) {
-    log('Skipping — weekend')
-    return NextResponse.json({ skipped: 'weekend' })
-  }
-  if (now.hour < 9 || now.hour >= 11) {
-    log(`Skipping — outside 9–11 AM NYC window (current: ${now.toFormat('HH:mm z')})`)
-    return NextResponse.json({ skipped: 'outside-window' })
+  if (!isTest) {
+    if (now.weekday > 5) {
+      log('Skipping — weekend')
+      return NextResponse.json({ skipped: 'weekend' })
+    }
+    if (now.hour < 9 || now.hour >= 11) {
+      log(`Skipping — outside 9–11 AM NYC window (current: ${now.toFormat('HH:mm z')})`)
+      return NextResponse.json({ skipped: 'outside-window' })
+    }
+  } else {
+    log(`Test mode — bypassing time/day gate (${now.toFormat('cccc HH:mm z')})`)
   }
 
   log(`Starting run — ${now.toFormat('cccc, LLLL d, HH:mm z')}`)
@@ -153,6 +160,18 @@ export async function GET(req: NextRequest) {
     ...Array.from(urlMap.values()).map((e) => e.candidate),
   ]
 
+  const channelDiag: Record<string, number | string> = {}
+  for (let i = 0; i < convChannels.length; i++) {
+    const r = convResults[i]
+    const name = CHANNEL_NAMES[convChannels[i]] ?? convChannels[i]
+    channelDiag[name] = r.status === 'fulfilled'
+      ? r.value.length
+      : (r.reason instanceof Error ? r.reason.message : String(r.reason))
+  }
+  channelDiag['introduce-yourself'] = introResult.status === 'fulfilled'
+    ? introResult.value.length
+    : (introResult.reason instanceof Error ? introResult.reason.message : String(introResult.reason))
+
   log(`${allCandidates.length} conversation candidates before Claude scoring`)
 
   // 5. Claude scoring
@@ -197,6 +216,15 @@ export async function GET(req: NextRequest) {
       reason: 'below-threshold',
       items: included.length,
       intros_carried: validIntros.length,
+      ...(isTest && {
+        _diag: {
+          channels: channelDiag,
+          candidates_total: allCandidates.length,
+          intro_candidates: todayIntros.length,
+          scored_include: scored.filter((s) => s.decision === 'Include').length,
+          scored_skip: scored.filter((s) => s.decision === 'Skip').length,
+        },
+      }),
     })
   }
 
@@ -228,7 +256,18 @@ export async function GET(req: NextRequest) {
 
   const post = lines.join('\n')
 
-  // 9. Post to Slack
+  // 9. Post to Slack (skip if dry run)
+  if (isDryRun) {
+    log('Dry run — skipping Slack post')
+    return NextResponse.json({
+      status: 'dry_run',
+      items: included.length,
+      intros: allIntros.length,
+      date: dateStr,
+      preview: post,
+    })
+  }
+
   log('Posting to #daily-recap-bot')
   await postMessage(CHANNELS.DAILY_RECAP, post)
   log('Posted successfully')

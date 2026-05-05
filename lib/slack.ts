@@ -45,9 +45,14 @@ export async function getUserName(userId: string): Promise<string> {
   }
 }
 
+async function joinChannel(channelId: string): Promise<void> {
+  await slackPost('conversations.join', { channel: channelId })
+}
+
 export async function getChannelMessages(channelId: string, oldest: number): Promise<SlackMessage[]> {
   const messages: SlackMessage[] = []
   let cursor: string | undefined
+  let joined = false
 
   do {
     const params: Record<string, string> = {
@@ -62,7 +67,12 @@ export async function getChannelMessages(channelId: string, oldest: number): Pro
       data = await slackGet('conversations.history', params)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (msg.includes('not_in_channel')) throw new Error('not_in_channel')
+      if (msg.includes('not_in_channel') && !joined) {
+        // Auto-join the channel and retry once (requires channels:join scope)
+        await joinChannel(channelId)
+        joined = true
+        continue
+      }
       throw err
     }
 
