@@ -49,8 +49,13 @@ export async function GET(req: NextRequest) {
   // DST-aware time check: run only if it's 9:00–10:59 AM New York time
   // Single cron at 14:30 UTC fires at 9:30 AM EST (winter) and 10:30 AM EDT (summer)
   // ?test=true bypasses time/day gate (requires valid CRON_SECRET)
+  // ?channel=<id> (test only) overrides post target — useful to DM yourself a preview
+  // ?lookback_hours=<N> (test only) overrides KV timestamps with now-N*3600 — useful to backfill
   const isTest = req.nextUrl.searchParams.get('test') === 'true'
   const isDryRun = req.nextUrl.searchParams.get('dry_run') === 'true'
+  const channelOverride = isTest ? req.nextUrl.searchParams.get('channel') : null
+  const lookbackHoursParam = isTest ? req.nextUrl.searchParams.get('lookback_hours') : null
+  const lookbackHours = lookbackHoursParam ? parseFloat(lookbackHoursParam) : null
   const now = DateTime.now().setZone('America/New_York')
   if (!isTest) {
     if (now.weekday > 5) {
@@ -78,6 +83,13 @@ export async function GET(req: NextRequest) {
 
   const lastReported: Record<string, number> = {}
   allChannels.forEach((ch, i) => { lastReported[ch] = lastTimestamps[i] })
+
+  // Test-only override: force a wider lookback window
+  if (lookbackHours && lookbackHours > 0) {
+    const overrideTs = Math.floor(Date.now() / 1000) - lookbackHours * 3600
+    for (const ch of allChannels) lastReported[ch] = overrideTs
+    log(`Test mode — lookback overridden to ${lookbackHours}h ago`)
+  }
 
   // 2. Fetch messages from all channels concurrently
   const [introResult, ...convResults] = await Promise.allSettled([
@@ -268,15 +280,21 @@ export async function GET(req: NextRequest) {
     })
   }
 
-  log('Posting to #daily-recap-bot')
-  await postMessage(CHANNELS.DAILY_RECAP, post)
+  const targetChannel = channelOverride ?? CHANNELS.DAILY_RECAP
+  log(`Posting to ${targetChannel}${channelOverride ? ' (test override)' : ' (#daily-recap-bot)'}`)
+  await postMessage(targetChannel, post)
   log('Posted successfully')
 
-  // 10. Update KV state — if this fails, log and continue (never double-post)
-  try {
-    await Promise.all([clearPendingIntros(), updateTimestamps()])
-  } catch (err) {
-    log(`KV update failed after post (non-fatal): ${err}`)
+  // 10. Update KV state — only on a real post (not when overriding the target channel)
+  // Test posts to a different channel must NOT advance the production state
+  if (!channelOverride) {
+    try {
+      await Promise.all([clearPendingIntros(), updateTimestamps()])
+    } catch (err) {
+      log(`KV update failed after post (non-fatal): ${err}`)
+    }
+  } else {
+    log('Test override — skipping KV state update')
   }
 
   return NextResponse.json({
@@ -284,5 +302,7 @@ export async function GET(req: NextRequest) {
     items: included.length,
     intros: allIntros.length,
     date: dateStr,
+    target: targetChannel,
+    test_override: !!channelOverride,
   })
 }
