@@ -81,9 +81,9 @@ TOP CONVERSATIONS RULES
 - Permalink: use the candidate's permalink verbatim. Do not modify.
 
 DIVISION OF RESPONSIBILITY: You return the data. The assembler formats the
-bullet and caps at ~320 chars (dropping the replier sentence if needed).
-Write tight, but never sacrifice spec compliance (especially the replier
-sentence) for length.
+bullet and caps at ~400 chars (dropping the replier sentence if needed).
+Brian's own May 5 reference sample runs ~400 chars per bullet, so don't
+over-compress. Write tight but complete sentences.
 
 INTRO RULES
 - Source: ONLY #introductions messages whose AUTHOR display name is
@@ -254,13 +254,14 @@ ${introBlock}`
 function assemblePost(data: RecapData, dateStr: string): string {
   const lines: string[] = [`*Top Conversations* — ${dateStr}`]
 
-  // Top Conversations: blank line between items. Soft cap ~320 chars per
-  // bullet (Brian's own sample runs ~400 chars; ~250 in spec is aspirational
-  // but his sample exceeds it 1.5×). Assembler drops replier sentence only
-  // if needed; never truncates summary mid-sentence.
+  // Top Conversations: blank line between items. Soft cap 400 chars per
+  // bullet — Brian's own May 5 sample runs ~400 chars per bullet (Scott
+  // Werner convo: ~410, Chuck convo: ~410). The "~250 chars" in his spec
+  // is aspirational; his real-world reference is ~400. Assembler drops
+  // replier sentence only if a bullet exceeds 400.
   const convoBullets: string[] = []
   for (const c of data.conversations) {
-    const bullet = buildConversationBullet(c, 320)
+    const bullet = buildConversationBullet(c, 400)
     if (bullet) convoBullets.push(bullet)
   }
   if (convoBullets.length > 0) {
