@@ -3,88 +3,132 @@ import { ConversationCandidate, IntroCandidate } from './types'
 
 const client = new Anthropic()
 
-// v2 prompt (Brian, May 6 2026). Replaces the prior editorial scoring loop with
-// a single-pass generator: we hand Claude the full day of data and it returns
-// the final post text. Header → Top Conversations (2–4) → New to the Community.
+// v2 prompt (Brian, May 6 2026). The LLM returns STRUCTURED JSON with the data
+// only — the route handler assembles the final post text deterministically so
+// hard caps, date format, and spacing are not at the LLM's discretion.
 const SYSTEM_PROMPT = `ROLE
-You write the TNB daily Slack recap. The post is the first thing community
-members see in the morning. It must be glanceable in under 30 seconds and
-must not require scrolling on a normal-sized Slack window.
+You curate the data for the TNB daily Slack recap. The post is the first
+thing community members see in the morning. It must be glanceable in under
+30 seconds. You return STRUCTURED JSON. Another component assembles the
+final post — do not return prose, headers, bullets, or markdown.
 
-OUTPUT STRUCTURE — fixed order, no exceptions
+INPUT
+You receive a list of conversation candidates (#share-and-discuss +
+#what-im-building) and a list of intro candidates (#introductions). Each
+candidate is annotated with author display name, reply count, and
+permalink. Reply candidates carry the replier's display name when Slack
+resolved it.
 
-1. HEADER (one line)
-   "*Top Conversations* — [Day, Mon D]"
+OUTPUT — return ONLY this JSON shape (no preamble, no code fence):
+{
+  "conversations": [
+    {
+      "author": "Full Name",
+      "channel": "share-and-discuss",
+      "summary": "Two-sentence summary of the original post. Concrete nouns and verbs.",
+      "replier_sentence": "Full Name replied that … OR null if no substantive replies",
+      "permalink": "https://slack.com/archives/…"
+    }
+  ],
+  "intros": [
+    {
+      "first_name": "Jesse",
+      "summary": "Two sentences max. Resume signal. Why in TNB.",
+      "permalink": "https://slack.com/archives/…"
+    }
+  ]
+}
 
-2. TOP CONVERSATIONS (2 to 4, ranked by reply count + reactions)
-   Sources: #share-and-discuss and #what-im-building.
+If there are zero qualifying conversations AND zero qualifying intros,
+return: {"conversations": [], "intros": []}
 
-   Count rule: 2 minimum, 4 maximum. Pick only threads that clear the
-   quality bar — either (a) 3+ substantive replies/reactions, OR (b) a
-   standalone build/announcement worth surfacing on its own. If fewer
-   than 2 threads clear the bar, fill to 2 with the next-best. If more
-   than 4 clear it, take the top 4 by reply + reaction count.
+TOP CONVERSATIONS RULES
+- 2 minimum, 4 maximum. Quality bar before count. Pick threads that have
+  3+ substantive replies/reactions OR are standalone build announcements
+  worth surfacing on their own.
+- Rank by reply count + reactions.
+- Author = Slack display name verbatim from the input. Do not abbreviate.
+- summary = exactly two sentences. Two periods. No semicolons substituting
+  for periods. Concrete nouns and verbs. Cut adjectives.
+- summary + replier_sentence + permalink will be assembled into a single
+  bullet capped at 250 characters total. Write conservatively. The
+  assembler will REJECT any conversation whose assembled bullet exceeds
+  the cap, so keep summary <= 180 chars and replier_sentence <= 120 chars.
+  Approximate budget: bullet = "• *Author* (#channel) — summary replier_sentence permalink"
+- replier_sentence options:
+   • "Tom Marks replied that …" (single replier)
+   • "Tom Marks and Iris ten Teije both noted …" (multiple repliers, similar
+     points — still name all of them)
+   • null (no substantive replies, OR replier name unresolved)
+- NEVER write "one user noted", "a reply pushed", "someone replied",
+  "Replies push the idea further", or any framing that strips the
+  replier's identity. If the name field is "(name unresolved)" or empty,
+  set replier_sentence to null.
+- Permalink: use the candidate's permalink verbatim. Do not modify.
 
-   Format per item (insert a blank line between items for readability):
-   • [Author Full Name] (#channel) — [Two-sentence summary of the original
-     post.] [If the post has substantive replies: one sentence per replier,
-     ALWAYS naming the replier by Slack display name ("Tom Marks replied
-     that…", "Chuck wondered whether…"), OR a single sentence collapsing
-     multiple repliers if they made similar points (still naming all of
-     them). Skip this entirely if no substantive replies.] [Permalink]
+INTRO RULES
+- Source: ONLY #introductions messages whose AUTHOR display name is
+  plausibly the same person being introduced (a self-intro). Welcomes
+  and third-party introductions are EXCLUDED — even though they may
+  appear in the candidate list.
+- Identifying a welcome: phrases like "everyone, please welcome…",
+  "@person — glad you're here", or where the message describes someone
+  in third person while the author is a different name. When in doubt,
+  drop it.
+- No count cap on legitimate self-intros. If 8 people self-introduced
+  yesterday, return all 8.
+- Dedup: if the same author posted multiple intro messages, concatenate
+  them and return ONE entry. The author's display name is the dedup key.
+- first_name = author's first name only. Strip last name. Strip emojis.
+- summary = two sentences max combining (a) most relevant resume/credential
+  signal and (b) why they are in TNB. Two periods. No run-on sentences
+  with semicolons or "while also" / "alongside" / commas joining four
+  ideas. Two clean sentences. Cut to fit.
+- Permalink: use the candidate's permalink verbatim.
 
-   Replier names are non-negotiable — never write "Reply pushed it further"
-   or "one user noted" or "someone replied." Always surface the actual
-   name. If the replier's name can't be resolved, drop the reply sentence
-   rather than write an anonymous one.
-
-   HARD CAP on this block: ~250 characters per conversation. So:
-     2 convos → ~500 chars, 3 convos → ~750 chars, 4 convos → ~1000 chars.
-   If you go over, cut adjectives and replies before cutting the post summary.
-
-3. NEW TO THE COMMUNITY (every self-intro from the prior day, no count cap)
-   Section header: "*New to the Community*"
-   Source: ONLY messages posted in #introductions whose author is the same
-   person being introduced. Welcomes, replies, third-party introductions, and
-   anything posted outside #introductions are excluded.
-
-   Dedup rule: one entry per person. If a person posted multiple consecutive
-   intro messages, concatenate them into a single source before summarizing.
-
-   Format per item (no extra blank line between items — these are short):
-   • [First Name] — [Two sentences max combining (a) the most relevant
-     resume/credential signal and (b) why they're in TNB.] [Permalink]
-
-TONE RULES
-- Neutral and factual. Never editorialize about authenticity, motive, or vibe.
-- BANNED phrasings (auto-reject): "says he's…", "claims to be…", "supposedly",
-  "the kind of person who…", "someone who's proven…", "one user noted",
-  "a reply pushed", or any framing that strips the replier's identity or
-  implies the person might not be genuine.
+TONE RULES (apply to summary and replier_sentence)
+- Neutral and factual. Never editorialize about authenticity, motive,
+  or vibe.
+- BANNED phrasings (auto-reject): "says he's…", "claims to be…",
+  "supposedly", "the kind of person who…", "someone who's proven…",
+  "one user noted", "a reply pushed". Anything that strips the replier's
+  identity or implies the person might not be genuine.
 - Tight noun-verb prose. Cut adjectives unless they carry information.
-- Names: full names in Top Conversations (post authors AND repliers).
-  First names only in New to the Community.
 
 EDGE CASES
-- Top Conversations: 2 minimum, 4 maximum. Quality bar before count.
-  Fill to 2 on slow days; cap at 4 on hot days.
-- A post with zero replies is still eligible (e.g., a build announcement)
-  if it's substantive on its own. Just omit the reply sentence.
-- If a replier's name can't be resolved, drop the reply sentence — never
-  write an anonymous one.
-- If zero self-intros yesterday, omit the "New to the Community" section
-  entirely — do not write a placeholder.
-- If the day has both a self-intro AND a welcome from Brian (or any other
-  member), only the self-intro counts. Welcomes and third-party intros
-  are excluded.
-- Duplicate person across multiple intro messages: concatenate, then summarize
-  once.
+- A post with zero replies is still eligible if it's substantive on its
+  own (build announcement, framework drop, original argument). Just set
+  replier_sentence to null.
+- If zero self-intros, return "intros": [].
+- If a self-intro AND a welcome both exist for the same person, count
+  only the self-intro.
+- Duplicate person across multiple intro messages: concatenate, summarize
+  once, one entry.`
 
-OUTPUT
-Return ONLY the final Slack post body — no preamble, no explanation, no
-JSON wrapper. Slack mrkdwn (use *bold* for the header and section header).
-If there are zero qualifying conversations AND zero self-intros, return the
-single token: SKIP`
+interface ConversationOut {
+  author: string
+  channel: string
+  summary: string
+  replier_sentence: string | null
+  permalink: string
+}
+
+interface IntroOut {
+  first_name: string
+  summary: string
+  permalink: string
+}
+
+interface RecapData {
+  conversations: ConversationOut[]
+  intros: IntroOut[]
+}
+
+interface GenerateInput {
+  dateStr: string // e.g. "Tue May 6" — used VERBATIM in header
+  conversations: ConversationCandidate[]
+  intros: IntroCandidate[]
+}
 
 function formatConversation(c: ConversationCandidate, index: number, maxReplies = 12, maxUrl = 1500): string {
   const replies = [...c.replies]
@@ -116,13 +160,7 @@ Permalink: ${i.permalink}
 Message: ${i.raw_text}`
 }
 
-interface GenerateInput {
-  dateStr: string // e.g. "Tue May 5"
-  conversations: ConversationCandidate[]
-  intros: IntroCandidate[]
-}
-
-async function callClaude(input: GenerateInput, maxReplies: number, maxUrl: number): Promise<string> {
+async function callClaude(input: GenerateInput, maxReplies: number, maxUrl: number): Promise<RecapData> {
   const convoBlock = input.conversations.length > 0
     ? input.conversations.map((c, i) => formatConversation(c, i, maxReplies, maxUrl)).join('\n\n')
     : '(no conversation candidates)'
@@ -131,11 +169,10 @@ async function callClaude(input: GenerateInput, maxReplies: number, maxUrl: numb
     ? input.intros.map((i, idx) => formatIntro(i, idx)).join('\n\n')
     : '(no intro candidates)'
 
-  const userPrompt = `Generate the TNB daily Slack recap for: ${input.dateStr}
+  const userPrompt = `Date for context (do not echo back, the assembler handles the header): ${input.dateStr}
 
-Use ONLY the data below. Do not invent posts, replies, names, or links.
-Apply the source/dedup rules in your instructions to filter intros — drop
-welcomes and third-party intros even though they are listed here.
+Apply your rules to the data below and return ONLY the JSON shape from your
+instructions. No preamble, no markdown, no code fences.
 
 === CONVERSATION CANDIDATES (#share-and-discuss + #what-im-building) ===
 ${convoBlock}
@@ -151,23 +188,94 @@ ${introBlock}`
   })
 
   const text = response.content[0]?.type === 'text' ? response.content[0].text : ''
-  return text.trim()
+  // Tolerate leading code fences or stray prose by extracting the first {...} block
+  const match = text.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error('no JSON object in Claude response')
+
+  const parsed = JSON.parse(match[0]) as Partial<RecapData>
+  return {
+    conversations: Array.isArray(parsed.conversations) ? parsed.conversations : [],
+    intros: Array.isArray(parsed.intros) ? parsed.intros : [],
+  }
+}
+
+function assemblePost(data: RecapData, dateStr: string): string {
+  const lines: string[] = [`*Top Conversations* — ${dateStr}`]
+
+  // Top Conversations: blank line between items, hard 250-char cap per bullet.
+  // If a bullet exceeds the cap, drop the replier sentence first; if still
+  // over, truncate the summary on a word boundary.
+  const convoBullets: string[] = []
+  for (const c of data.conversations) {
+    const bullet = buildConversationBullet(c, 250)
+    if (bullet) convoBullets.push(bullet)
+  }
+  if (convoBullets.length > 0) {
+    lines.push('') // blank line after header
+    lines.push(convoBullets.join('\n\n')) // blank line between conversations
+  }
+
+  // New to the Community: NO blank line between items, tight stack.
+  if (data.intros.length > 0) {
+    lines.push('') // blank line before section header
+    lines.push('*New to the Community*')
+    for (const i of data.intros) {
+      const bullet = buildIntroBullet(i)
+      if (bullet) lines.push(bullet)
+    }
+  }
+
+  return lines.join('\n')
+}
+
+function buildConversationBullet(c: ConversationOut, cap: number): string | null {
+  if (!c.author || !c.channel || !c.summary || !c.permalink) return null
+  const channel = c.channel.replace(/^#/, '')
+  const summary = c.summary.trim()
+  const replier = (c.replier_sentence ?? '').trim()
+
+  let bullet = `• *${c.author}* (#${channel}) — ${summary}${replier ? ' ' + replier : ''} ${c.permalink}`
+  if (bullet.length <= cap) return bullet
+
+  // Drop replier first
+  bullet = `• *${c.author}* (#${channel}) — ${summary} ${c.permalink}`
+  if (bullet.length <= cap) return bullet
+
+  // Truncate summary on a word boundary, leaving room for "… " + permalink
+  const head = `• *${c.author}* (#${channel}) — `
+  const tailLen = c.permalink.length + 2 // space + permalink
+  const summaryBudget = cap - head.length - tailLen - 1 // -1 for ellipsis space
+  if (summaryBudget < 40) {
+    // Author + channel + permalink alone already too long; keep raw bullet
+    // (rare; LLM should not produce). Return uncapped — better than nothing.
+    return `• *${c.author}* (#${channel}) — ${summary} ${c.permalink}`
+  }
+  const truncated = summary.slice(0, summaryBudget).replace(/\s+\S*$/, '').trim() + '…'
+  return `${head}${truncated} ${c.permalink}`
+}
+
+function buildIntroBullet(i: IntroOut): string | null {
+  if (!i.first_name || !i.summary) return null
+  const summary = i.summary.trim()
+  const link = i.permalink ? ` ${i.permalink}` : ''
+  return `• ${i.first_name} — ${summary}${link}`
 }
 
 export async function generateRecap(input: GenerateInput): Promise<string | null> {
   if (input.conversations.length === 0 && input.intros.length === 0) return null
 
-  let body: string
+  let data: RecapData
   try {
-    body = await callClaude(input, 12, 1500)
+    data = await callClaude(input, 12, 1500)
   } catch {
     try {
-      body = await callClaude(input, 6, 600)
+      data = await callClaude(input, 6, 600)
     } catch {
       return null
     }
   }
 
-  if (!body || body.trim().toUpperCase() === 'SKIP') return null
-  return body
+  if (data.conversations.length === 0 && data.intros.length === 0) return null
+
+  return assemblePost(data, input.dateStr)
 }
