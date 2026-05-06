@@ -49,17 +49,24 @@ TOP CONVERSATIONS RULES
 - Rank by reply count + reactions.
 - Author = Slack display name verbatim from the input. Do not abbreviate.
 - summary = exactly two sentences with two PERIODS. Concrete nouns and verbs.
-  HARD LENGTH BUDGET: 130 characters MAX (count them). Cut adjectives,
-  qualifiers, and parentheticals to fit. Never use semicolons as periods.
-  Never write run-on sentences with "while also", "alongside", or commas
-  joining four ideas. Two clean short sentences.
+  TARGET 100–130 characters. Cut adjectives, qualifiers, and parentheticals
+  to fit. Never use semicolons as periods. Never write run-on sentences
+  with "while also", "alongside", or commas joining four ideas. Two clean
+  short sentences.
   Don't open the summary by re-stating the author's name — they're already
   in the bullet header. Lead with the verb: "Argues that…", "Shipped a…",
   "Links a piece arguing…", not "Brian posted that…".
-- replier_sentence: ONE short sentence. HARD LENGTH BUDGET: 110 characters MAX.
+- replier_sentence: ONE short sentence. TARGET 80–110 characters.
   REQUIRED whenever the candidate has substantive replies AND at least one
-  replier name is resolved (not "(name unresolved)" or empty). Do not omit
-  it just because the budget feels tight — write it tighter, but include it.
+  replier name is resolved (not "(name unresolved)" or empty).
+
+  CRITICAL: Do NOT omit the replier_sentence to "save space" or "fit a cap".
+  The downstream assembler handles all length capping — your only job is to
+  return correct data. If summary + replier together would be long, write
+  the replier sentence tighter, but ALWAYS include it. The assembler will
+  drop it only if the bullet truly cannot fit; that is its decision, not
+  yours. Returning null for replier_sentence when valid replies exist is a
+  spec violation.
   Options:
    • "Tom Marks replied that …" (single replier)
    • "Tom Marks and Iris ten Teije noted …" (multiple repliers, similar points)
@@ -73,10 +80,10 @@ TOP CONVERSATIONS RULES
   set replier_sentence to null.
 - Permalink: use the candidate's permalink verbatim. Do not modify.
 
-The downstream assembler caps each bullet at ~280 chars. If your summary +
-replier blows past the budget, the assembler drops the replier sentence to
-keep the bullet readable. So WRITE TIGHT FROM THE START — don't rely on
-truncation, and never plan to overflow.
+DIVISION OF RESPONSIBILITY: You return the data. The assembler formats the
+bullet and caps at ~320 chars (dropping the replier sentence if needed).
+Write tight, but never sacrifice spec compliance (especially the replier
+sentence) for length.
 
 INTRO RULES
 - Source: ONLY #introductions messages whose AUTHOR display name is
