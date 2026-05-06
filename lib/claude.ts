@@ -212,6 +212,9 @@ Permalink: ${i.permalink}
 Message: ${i.raw_text}`
 }
 
+// Last raw LLM JSON, exposed for dry-run diagnostics
+export let lastLLMOutput: RecapData | null = null
+
 async function callClaude(input: GenerateInput, maxReplies: number, maxUrl: number): Promise<RecapData> {
   const convoBlock = input.conversations.length > 0
     ? input.conversations.map((c, i) => formatConversation(c, i, maxReplies, maxUrl)).join('\n\n')
@@ -245,10 +248,12 @@ ${introBlock}`
   if (!match) throw new Error('no JSON object in Claude response')
 
   const parsed = JSON.parse(match[0]) as Partial<RecapData>
-  return {
+  const out: RecapData = {
     conversations: Array.isArray(parsed.conversations) ? parsed.conversations : [],
     intros: Array.isArray(parsed.intros) ? parsed.intros : [],
   }
+  lastLLMOutput = out
+  return out
 }
 
 function assemblePost(data: RecapData, dateStr: string): string {
@@ -328,19 +333,28 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
 
   if (data.conversations.length === 0 && data.intros.length === 0) return null
 
+  console.log('[builder-bot] LLM raw output:', JSON.stringify(data, null, 2))
+
   // Deterministic fallback: if the LLM omitted replier_sentence on a convo
   // that has resolved replier names in the candidate input, fill it in from
-  // the first substantive reply. The LLM is supposed to do this; the fallback
-  // is a guard for when it self-censors anyway.
+  // the first substantive reply. Match candidate by permalink (preferred) or
+  // author + channel (fallback if LLM altered the permalink).
   for (const c of data.conversations) {
-    if (c.replier_sentence) continue
-    const candidate = input.conversations.find((cc) => cc.permalink === c.permalink)
-    if (!candidate) continue
+    if (c.replier_sentence && c.replier_sentence.trim()) continue
+    const candidate =
+      input.conversations.find((cc) => cc.permalink === c.permalink) ??
+      input.conversations.find((cc) => cc.user_name === c.author && cc.channel_name === c.channel.replace(/^#/, ''))
+    if (!candidate) {
+      console.log(`[builder-bot] fallback skip: no candidate match for ${c.author} permalink=${c.permalink}`)
+      continue
+    }
     const resolvedReplies = candidate.replies.filter(
       (r) => r.user_name && !r.user_name.toLowerCase().includes('unresolved')
     )
-    if (resolvedReplies.length === 0) continue
-    // Spec: full names in Top Conversations (post authors AND repliers).
+    if (resolvedReplies.length === 0) {
+      console.log(`[builder-bot] fallback skip: ${candidate.user_name} has 0 resolved replies`)
+      continue
+    }
     const fullName = resolvedReplies[0].user_name!.trim()
     const snippet = resolvedReplies[0].text
       .replace(/<[^>]+>/g, '')
@@ -350,6 +364,7 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
       .replace(/\s+\S*$/, '')
       .replace(/[.!?]+$/, '')
     c.replier_sentence = `${fullName} replied that ${snippet}.`
+    console.log(`[builder-bot] fallback applied for ${c.author}: ${c.replier_sentence}`)
   }
 
   return assemblePost(data, input.dateStr)

@@ -14,7 +14,7 @@ import {
   postMessage,
   makeDeepLink,
 } from '@/lib/slack'
-import { generateRecap } from '@/lib/claude'
+import { generateRecap, lastLLMOutput } from '@/lib/claude'
 import { fetchUrlContent, extractFirstUrl } from '@/lib/url-fetch'
 import { ConversationCandidate, IntroCandidate, PendingIntro } from '@/lib/types'
 
@@ -291,6 +291,7 @@ export async function GET(req: NextRequest) {
           first_80: r.text.slice(0, 80),
         })),
       })),
+      _llm_raw: lastLLMOutput,
     })
   }
 
