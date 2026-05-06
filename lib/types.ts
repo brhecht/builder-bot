@@ -12,6 +12,7 @@ export interface SlackMessage {
 export interface SlackReply {
   user?: string
   username?: string
+  user_name?: string
   text: string
   ts: string
 }
@@ -28,6 +29,7 @@ export interface PendingIntro {
   name: string
   summary: string
   collected_date: string // YYYY-MM-DD
+  permalink?: string
 }
 
 export interface ConversationCandidate {
@@ -38,6 +40,7 @@ export interface ConversationCandidate {
   text: string
   replies: SlackReply[]
   reply_count: number
+  permalink: string
   url?: string
   url_content?: string
 }
@@ -45,6 +48,9 @@ export interface ConversationCandidate {
 export interface IntroCandidate {
   ts: string
   raw_text: string
+  user_id: string
+  user_name: string
+  permalink: string
 }
 
 export interface ScoredItem {

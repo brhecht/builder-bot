@@ -98,13 +98,18 @@ export async function getThreadReplies(channelId: string, ts: string): Promise<S
       limit: '50',
     })
     const msgs = (data.messages as SlackMessage[]) ?? []
-    // First message is the parent — skip it
-    return msgs.slice(1).map((m) => ({
-      user: m.user,
-      username: m.username,
-      text: m.text,
-      ts: m.ts,
-    }))
+    // First message is the parent — skip it. Resolve display names for repliers
+    // so the LLM can name them in the recap (avoids "one user noted" patterns).
+    const tail = msgs.slice(1)
+    return await Promise.all(
+      tail.map(async (m) => ({
+        user: m.user,
+        username: m.username,
+        user_name: m.user ? await getUserName(m.user) : (m.username ?? ''),
+        text: m.text,
+        ts: m.ts,
+      }))
+    )
   } catch {
     return []
   }

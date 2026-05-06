@@ -14,9 +14,9 @@ import {
   postMessage,
   makeDeepLink,
 } from '@/lib/slack'
-import { scoreAndSummarize, processIntro } from '@/lib/claude'
+import { generateRecap } from '@/lib/claude'
 import { fetchUrlContent, extractFirstUrl } from '@/lib/url-fetch'
-import { ConversationCandidate, IntroCandidate, PendingIntro, SlackMessage } from '@/lib/types'
+import { ConversationCandidate, IntroCandidate, PendingIntro } from '@/lib/types'
 
 // maxDuration for App Router route handlers
 export const maxDuration = 60
@@ -33,6 +33,18 @@ const CHANNEL_NAMES: Record<string, string> = {
   [process.env.SLACK_CHANNEL_SHARE_AND_DISCUSS ?? '']: 'share-and-discuss',
   [process.env.SLACK_CHANNEL_WHAT_IM_BUILDING ?? '']: 'what-im-building',
   [process.env.SLACK_CHANNEL_GENERAL ?? '']: 'general',
+  [process.env.SLACK_CHANNEL_INTRODUCE_YOURSELF ?? '']: 'introductions',
+}
+
+// DM-mode targets: Brian + Nico for now (testing). Comma-separated user/channel
+// IDs in SLACK_DM_TARGETS override the public #daily-recap-bot channel.
+function getRecapTargets(): string[] {
+  const dmTargets = (process.env.SLACK_DM_TARGETS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (dmTargets.length > 0) return dmTargets
+  return [CHANNELS.DAILY_RECAP]
 }
 
 function log(msg: string) {
@@ -97,20 +109,28 @@ export async function GET(req: NextRequest) {
     ...convChannels.map((ch) => getChannelMessages(ch, lastReported[ch])),
   ])
 
-  // 3. Extract intro candidates
-  const todayIntros: IntroCandidate[] = []
+  // 3. Build intro candidates with author + permalink. v2 prompt enforces the
+  // self-intro filter (drops welcomes / third-party intros) so we pass author
+  // metadata through; we still pre-trim very short messages to save tokens.
+  const introCandidates: IntroCandidate[] = []
   if (introResult.status === 'fulfilled') {
     for (const msg of introResult.value) {
-      // Substantial messages in #introduce-yourself are intro posts
-      if (msg.text && msg.text.length > 80) {
-        todayIntros.push({ ts: msg.ts, raw_text: msg.text })
-      }
+      if (!msg.text || msg.text.length < 80) continue
+      const userId = msg.user ?? msg.username ?? 'unknown'
+      const userName = await getUserName(userId)
+      introCandidates.push({
+        ts: msg.ts,
+        raw_text: msg.text,
+        user_id: userId,
+        user_name: userName,
+        permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, msg.ts),
+      })
     }
   } else {
     log(`#introduce-yourself unavailable: ${introResult.reason}`)
   }
 
-  // 4. Build conversation candidates with URL dedup
+  // 4. Build conversation candidates with URL dedup + replier display names
   const urlMap = new Map<string, { candidate: ConversationCandidate; score: number }>()
   const noUrlCandidates: ConversationCandidate[] = []
 
@@ -150,6 +170,7 @@ export async function GET(req: NextRequest) {
         text: msg.text,
         replies,
         reply_count: msg.reply_count ?? 0,
+        permalink: makeDeepLink(channelId, msg.ts),
         url,
         url_content: urlContent,
       }
@@ -180,113 +201,94 @@ export async function GET(req: NextRequest) {
       ? r.value.length
       : (r.reason instanceof Error ? r.reason.message : String(r.reason))
   }
-  channelDiag['introduce-yourself'] = introResult.status === 'fulfilled'
+  channelDiag['introductions'] = introResult.status === 'fulfilled'
     ? introResult.value.length
     : (introResult.reason instanceof Error ? introResult.reason.message : String(introResult.reason))
 
-  log(`${allCandidates.length} conversation candidates before Claude scoring`)
-
-  // 5. Claude scoring
-  const scored = await scoreAndSummarize(allCandidates)
-
-  // Enforce max 2 per channel, max 3 total
-  const channelCounts: Record<string, number> = {}
-  const included = scored
-    .filter((s) => s.decision === 'Include')
-    .filter((s) => {
-      const ch = s.candidate.channel_id
-      channelCounts[ch] = (channelCounts[ch] ?? 0) + 1
-      return channelCounts[ch] <= 2
-    })
-    .slice(0, 3)
-
-  log(`${included.length} items after Claude curation`)
+  log(`${allCandidates.length} conversation candidates, ${introCandidates.length} intro candidates`)
 
   const nowTs = Math.floor(Date.now() / 1000)
   const todayStr = now.toISODate()!
+  const dateStr = now.toFormat('ccc LLL d') // e.g. "Tue May 5" — matches v2 prompt sample
 
   const updateTimestamps = () =>
     Promise.all(allChannels.map((ch) => setLastReported(ch, nowTs)))
 
-  // 6. Skip logic
-  if (included.length < 2) {
-    log('Skipping post — fewer than 2 qualifying items')
+  // 5. Carry forward intros that pre-date today (kept as PendingIntro for the
+  //    legacy KV format). We surface their raw text + permalink to the LLM.
+  const carriedIntroCandidates: IntroCandidate[] = pendingIntros
+    .filter((p): p is PendingIntro => !!p && !!p.summary)
+    .map((p) => ({
+      ts: '',
+      raw_text: p.summary, // legacy summary; LLM will treat as message body
+      user_id: '',
+      user_name: p.name ?? '',
+      permalink: p.permalink ?? '',
+    }))
 
-    // Carry forward any new intros
-    const freshIntros = await Promise.all(
-      todayIntros.map((i) => processIntro(i, todayStr).catch(() => null))
-    )
-    const validIntros = freshIntros.filter((i): i is PendingIntro => i !== null)
+  const allIntros: IntroCandidate[] = [...carriedIntroCandidates, ...introCandidates]
+
+  // 6. Generate the recap in one pass
+  const post = await generateRecap({
+    dateStr,
+    conversations: allCandidates,
+    intros: allIntros,
+  })
+
+  // 7. Skip logic — generator returns null when nothing qualifies
+  if (!post) {
+    log('Skipping post — generator returned no recap (empty day or below threshold)')
+
+    // Carry forward today's intros so they appear in the next post
+    const newPending: PendingIntro[] = introCandidates.map((i) => ({
+      name: i.user_name,
+      summary: i.raw_text.slice(0, 500),
+      collected_date: todayStr,
+      permalink: i.permalink,
+    }))
 
     await Promise.all([
-      setPendingIntros([...pendingIntros, ...validIntros]),
+      setPendingIntros([...pendingIntros, ...newPending]),
       updateTimestamps(),
     ])
 
     return NextResponse.json({
       status: 'skipped',
       reason: 'below-threshold',
-      items: included.length,
-      intros_carried: validIntros.length,
+      candidates: allCandidates.length,
+      intros: allIntros.length,
+      intros_carried: newPending.length,
       ...(isTest && {
         _diag: {
           channels: channelDiag,
-          candidates_total: allCandidates.length,
-          intro_candidates: todayIntros.length,
-          scored_include: scored.filter((s) => s.decision === 'Include').length,
-          scored_skip: scored.filter((s) => s.decision === 'Skip').length,
         },
       }),
     })
   }
 
-  // 7. Process intros for today + carry forward
-  const freshIntros = await Promise.all(
-    todayIntros.map((i) => processIntro(i, todayStr).catch(() => null))
-  )
-  const allIntros: PendingIntro[] = [
-    ...pendingIntros,
-    ...freshIntros.filter((i): i is PendingIntro => i !== null),
-  ]
-
-  // 8. Build the post
-  const dateStr = now.toFormat('cccc, LLLL d') // e.g. "Wednesday, April 23"
-  const lines: string[] = [`*Top Builder Conversations — ${dateStr}*`]
-
-  if (allIntros.length > 0) {
-    lines.push('\n👋 *New to the community*')
-    for (const intro of allIntros) {
-      lines.push(`• *${intro.name}* — ${intro.summary}`)
-    }
-  }
-
-  lines.push('\n💬 *Top Builder Conversations*')
-  for (const item of included) {
-    const link = makeDeepLink(item.candidate.channel_id, item.candidate.ts)
-    lines.push(`• *${item.candidate.user_name}* (#${item.candidate.channel_name}) — ${item.summary} ${link}`)
-  }
-
-  const post = lines.join('\n')
-
-  // 9. Post to Slack (skip if dry run)
+  // 8. Post to Slack (skip if dry run)
   if (isDryRun) {
     log('Dry run — skipping Slack post')
     return NextResponse.json({
       status: 'dry_run',
-      items: included.length,
+      candidates: allCandidates.length,
       intros: allIntros.length,
       date: dateStr,
       preview: post,
     })
   }
 
-  const targetChannel = channelOverride ?? CHANNELS.DAILY_RECAP
-  log(`Posting to ${targetChannel}${channelOverride ? ' (test override)' : ' (#daily-recap-bot)'}`)
-  await postMessage(targetChannel, post)
-  log('Posted successfully')
+  const targets = channelOverride ? [channelOverride] : getRecapTargets()
+  log(`Posting to ${targets.length} target(s): ${targets.join(', ')}${channelOverride ? ' (test override)' : ''}`)
 
-  // 10. Update KV state — only on a real post (not when overriding the target channel)
-  // Test posts to a different channel must NOT advance the production state
+  const postResults = await Promise.allSettled(targets.map((t) => postMessage(t, post)))
+  const failed = postResults
+    .map((r, i) => (r.status === 'rejected' ? { target: targets[i], error: r.reason instanceof Error ? r.reason.message : String(r.reason) } : null))
+    .filter((x): x is { target: string; error: string } => x !== null)
+  if (failed.length > 0) log(`Post failures: ${JSON.stringify(failed)}`)
+  log(`Posted to ${targets.length - failed.length}/${targets.length} target(s)`)
+
+  // 9. Update KV state — only on a real (non-overridden) post
   if (!channelOverride) {
     try {
       await Promise.all([clearPendingIntros(), updateTimestamps()])
@@ -299,10 +301,11 @@ export async function GET(req: NextRequest) {
 
   return NextResponse.json({
     status: 'posted',
-    items: included.length,
+    candidates: allCandidates.length,
     intros: allIntros.length,
     date: dateStr,
-    target: targetChannel,
+    targets,
+    failed,
     test_override: !!channelOverride,
   })
 }

@@ -1,48 +1,147 @@
 import Anthropic from '@anthropic-ai/sdk'
-import { ConversationCandidate, IntroCandidate, PendingIntro, ScoredItem } from './types'
+import { ConversationCandidate, IntroCandidate } from './types'
 
 const client = new Anthropic()
 
-const SYSTEM_PROMPT = `You are the editorial voice of The New Builder — a community of founders and builders who use AI seriously in their work. These are not hobbyists. They are people building real products and companies.
+// v2 prompt (Brian, May 6 2026). Replaces the prior editorial scoring loop with
+// a single-pass generator: we hand Claude the full day of data and it returns
+// the final post text. Header → Top Conversations (2–4) → New to the Community.
+const SYSTEM_PROMPT = `ROLE
+You write the TNB daily Slack recap. The post is the first thing community
+members see in the morning. It must be glanceable in under 30 seconds and
+must not require scrolling on a normal-sized Slack window.
 
-Your job is to select and summarize the most substantive, interesting activity from the past period in The New Builder Slack. You are curating, not logging. You have editorial judgment. Use it.
+OUTPUT STRUCTURE — fixed order, no exceptions
 
-A good item: someone shipped something specific, shared an insight that challenges an assumption, or sparked a conversation where people actually disagreed or built on each other's ideas.
+1. HEADER (one line)
+   "*Top Conversations* — [Day, Mon D]"
 
-A bad item: banter, generic enthusiasm, vague questions with no follow-up, or link drops with no context or reaction.
+2. TOP CONVERSATIONS (2 to 4, ranked by reply count + reactions)
+   Sources: #share-and-discuss and #what-im-building.
 
-When writing summaries: be specific. Name what the person built or said. Name what made it interesting. Write to make someone curious enough to click. No hype. No filler. Max 2-3 lines per item.
+   Count rule: 2 minimum, 4 maximum. Pick only threads that clear the
+   quality bar — either (a) 3+ substantive replies/reactions, OR (b) a
+   standalone build/announcement worth surfacing on its own. If fewer
+   than 2 threads clear the bar, fill to 2 with the next-best. If more
+   than 4 clear it, take the top 4 by reply + reaction count.
 
-For new member intros: draw from both the referrer's introduction and the member's own words. Make them sound like someone worth knowing.`
+   Format per item (insert a blank line between items for readability):
+   • [Author Full Name] (#channel) — [Two-sentence summary of the original
+     post.] [If the post has substantive replies: one sentence per replier,
+     ALWAYS naming the replier by Slack display name ("Tom Marks replied
+     that…", "Chuck wondered whether…"), OR a single sentence collapsing
+     multiple repliers if they made similar points (still naming all of
+     them). Skip this entirely if no substantive replies.] [Permalink]
 
-function formatCandidate(c: ConversationCandidate, index: number, maxReplies = 10, maxUrl = 2000): string {
+   Replier names are non-negotiable — never write "Reply pushed it further"
+   or "one user noted" or "someone replied." Always surface the actual
+   name. If the replier's name can't be resolved, drop the reply sentence
+   rather than write an anonymous one.
+
+   HARD CAP on this block: ~250 characters per conversation. So:
+     2 convos → ~500 chars, 3 convos → ~750 chars, 4 convos → ~1000 chars.
+   If you go over, cut adjectives and replies before cutting the post summary.
+
+3. NEW TO THE COMMUNITY (every self-intro from the prior day, no count cap)
+   Section header: "*New to the Community*"
+   Source: ONLY messages posted in #introductions whose author is the same
+   person being introduced. Welcomes, replies, third-party introductions, and
+   anything posted outside #introductions are excluded.
+
+   Dedup rule: one entry per person. If a person posted multiple consecutive
+   intro messages, concatenate them into a single source before summarizing.
+
+   Format per item (no extra blank line between items — these are short):
+   • [First Name] — [Two sentences max combining (a) the most relevant
+     resume/credential signal and (b) why they're in TNB.] [Permalink]
+
+TONE RULES
+- Neutral and factual. Never editorialize about authenticity, motive, or vibe.
+- BANNED phrasings (auto-reject): "says he's…", "claims to be…", "supposedly",
+  "the kind of person who…", "someone who's proven…", "one user noted",
+  "a reply pushed", or any framing that strips the replier's identity or
+  implies the person might not be genuine.
+- Tight noun-verb prose. Cut adjectives unless they carry information.
+- Names: full names in Top Conversations (post authors AND repliers).
+  First names only in New to the Community.
+
+EDGE CASES
+- Top Conversations: 2 minimum, 4 maximum. Quality bar before count.
+  Fill to 2 on slow days; cap at 4 on hot days.
+- A post with zero replies is still eligible (e.g., a build announcement)
+  if it's substantive on its own. Just omit the reply sentence.
+- If a replier's name can't be resolved, drop the reply sentence — never
+  write an anonymous one.
+- If zero self-intros yesterday, omit the "New to the Community" section
+  entirely — do not write a placeholder.
+- If the day has both a self-intro AND a welcome from Brian (or any other
+  member), only the self-intro counts. Welcomes and third-party intros
+  are excluded.
+- Duplicate person across multiple intro messages: concatenate, then summarize
+  once.
+
+OUTPUT
+Return ONLY the final Slack post body — no preamble, no explanation, no
+JSON wrapper. Slack mrkdwn (use *bold* for the header and section header).
+If there are zero qualifying conversations AND zero self-intros, return the
+single token: SKIP`
+
+function formatConversation(c: ConversationCandidate, index: number, maxReplies = 12, maxUrl = 1500): string {
   const replies = [...c.replies]
     .sort((a, b) => b.text.length - a.text.length)
     .slice(0, maxReplies)
 
-  return `--- Item ${index + 1} ---
+  const replyLines = replies.length > 0
+    ? replies
+        .map((r) => `  • ${r.user_name ? `${r.user_name}: ` : '(name unresolved) '}${r.text}`)
+        .join('\n')
+    : '  (none)'
+
+  return `--- Conversation ${index + 1} ---
 Channel: #${c.channel_name}
-Posted by: ${c.user_name}
-Text: ${c.text}
-Total replies: ${c.reply_count}
-${c.url_content ? `URL content: ${c.url_content.slice(0, maxUrl)}` : '(no URL)'}
-Replies (most substantive first):
-${replies.length > 0 ? replies.map((r) => `  • ${r.text}`).join('\n') : '  (none)'}`
+Author: ${c.user_name}
+Reply count: ${c.reply_count}
+Permalink: ${c.permalink}
+Post: ${c.text}
+${c.url_content ? `Linked URL content (truncated): ${c.url_content.slice(0, maxUrl)}` : '(no linked URL)'}
+Replies (most substantive first, with replier display name):
+${replyLines}`
 }
 
-async function callClaude(candidates: ConversationCandidate[], maxReplies: number, maxUrl: number): Promise<ScoredItem[]> {
-  const formatted = candidates.map((c, i) => formatCandidate(c, i, maxReplies, maxUrl)).join('\n\n')
+function formatIntro(i: IntroCandidate, index: number): string {
+  return `--- Intro ${index + 1} ---
+Author display name: ${i.user_name}
+Author user_id: ${i.user_id}
+Permalink: ${i.permalink}
+Message: ${i.raw_text}`
+}
 
-  const userPrompt = `Evaluate each of the following ${candidates.length} Slack thread(s). For each:
-1. Score "Include" or "Skip"
-2. One-line reason
-3. If Include: write the final 2-3 line summary for the daily recap (be specific, no hype)
+interface GenerateInput {
+  dateStr: string // e.g. "Tue May 5"
+  conversations: ConversationCandidate[]
+  intros: IntroCandidate[]
+}
 
-Respond ONLY with a JSON array:
-[{"item": 1, "decision": "Include", "reason": "...", "summary": "..."}, ...]
+async function callClaude(input: GenerateInput, maxReplies: number, maxUrl: number): Promise<string> {
+  const convoBlock = input.conversations.length > 0
+    ? input.conversations.map((c, i) => formatConversation(c, i, maxReplies, maxUrl)).join('\n\n')
+    : '(no conversation candidates)'
 
-Items:
-${formatted}`
+  const introBlock = input.intros.length > 0
+    ? input.intros.map((i, idx) => formatIntro(i, idx)).join('\n\n')
+    : '(no intro candidates)'
+
+  const userPrompt = `Generate the TNB daily Slack recap for: ${input.dateStr}
+
+Use ONLY the data below. Do not invent posts, replies, names, or links.
+Apply the source/dedup rules in your instructions to filter intros — drop
+welcomes and third-party intros even though they are listed here.
+
+=== CONVERSATION CANDIDATES (#share-and-discuss + #what-im-building) ===
+${convoBlock}
+
+=== INTRO CANDIDATES (#introductions, raw — apply self-intro filter) ===
+${introBlock}`
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-6',
@@ -51,72 +150,24 @@ ${formatted}`
     messages: [{ role: 'user', content: userPrompt }],
   })
 
-  const text = response.content[0].type === 'text' ? response.content[0].text : ''
-  const match = text.match(/\[[\s\S]*\]/)
-  if (!match) throw new Error('no JSON array in Claude response')
-
-  const results = JSON.parse(match[0]) as Array<{
-    item: number
-    decision: string
-    reason: string
-    summary?: string
-  }>
-
-  return candidates.map((c, i) => {
-    const r = results.find((x) => x.item === i + 1)
-    return {
-      candidate: c,
-      decision: r?.decision === 'Include' ? 'Include' : 'Skip',
-      summary: r?.summary,
-    }
-  })
+  const text = response.content[0]?.type === 'text' ? response.content[0].text : ''
+  return text.trim()
 }
 
-export async function scoreAndSummarize(candidates: ConversationCandidate[]): Promise<ScoredItem[]> {
-  if (candidates.length === 0) return []
+export async function generateRecap(input: GenerateInput): Promise<string | null> {
+  if (input.conversations.length === 0 && input.intros.length === 0) return null
 
+  let body: string
   try {
-    return await callClaude(candidates, 10, 2000)
+    body = await callClaude(input, 12, 1500)
   } catch {
-    // Retry with truncated input
     try {
-      return await callClaude(candidates, 5, 1000)
+      body = await callClaude(input, 6, 600)
     } catch {
-      // Total failure — skip everything
-      return candidates.map((c) => ({ candidate: c, decision: 'Skip' as const }))
+      return null
     }
   }
-}
 
-export async function processIntro(intro: IntroCandidate, date: string): Promise<PendingIntro> {
-  const response = await client.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 200,
-    system: SYSTEM_PROMPT,
-    messages: [{
-      role: 'user',
-      content: `Extract the new member's name and write a 1-2 line intro summary from this #introduce-yourself message. Draw from the referrer's words and the member's own description. Make them sound like someone worth knowing.
-
-Return ONLY JSON: {"name": "...", "summary": "..."}
-
-Message:
-${intro.raw_text}`,
-    }],
-  })
-
-  const text = response.content[0].type === 'text' ? response.content[0].text : ''
-  const match = text.match(/\{[\s\S]*\}/)
-  if (match) {
-    try {
-      const parsed = JSON.parse(match[0]) as { name: string; summary: string }
-      return { name: parsed.name, summary: parsed.summary, collected_date: date }
-    } catch { /* fall through */ }
-  }
-
-  // Fallback: use first 200 chars of the message
-  return {
-    name: 'New Member',
-    summary: intro.raw_text.slice(0, 200),
-    collected_date: date,
-  }
+  if (!body || body.trim().toUpperCase() === 'SKIP') return null
+  return body
 }
