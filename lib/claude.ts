@@ -291,6 +291,46 @@ function assemblePost(data: RecapData, dateStr: string): string {
   return lines.join('\n')
 }
 
+/**
+ * Compress a string to <= maxLen by:
+ *   1. If already <= maxLen, return as-is.
+ *   2. Try keeping only the first sentence (split on ". " then prefer the
+ *      longest prefix of full sentences that fits).
+ *   3. If even one sentence is too long, truncate to last word boundary
+ *      under maxLen and append a period.
+ * Always preserves grammatical sentences (never cuts mid-word).
+ */
+function compressByPeriodOrWord(s: string, maxLen: number): string {
+  const text = s.trim()
+  if (text.length <= maxLen) return text
+
+  // Split on sentence boundaries (period followed by space + capital, OR end)
+  const sentences: string[] = []
+  let buf = ''
+  for (let i = 0; i < text.length; i++) {
+    buf += text[i]
+    if (text[i] === '.' && (i === text.length - 1 || /\s[A-Z]/.test(text.slice(i + 1, i + 3)))) {
+      sentences.push(buf.trim())
+      buf = ''
+    }
+  }
+  if (buf.trim()) sentences.push(buf.trim())
+
+  // Greedy: keep as many full sentences as fit
+  let acc = ''
+  for (const sent of sentences) {
+    const next = acc ? `${acc} ${sent}` : sent
+    if (next.length > maxLen) break
+    acc = next
+  }
+  if (acc) return acc
+
+  // Even the first sentence is too long — truncate at word boundary.
+  const head = text.slice(0, maxLen - 1)
+  const trimmed = head.replace(/\s+\S*$/, '').replace(/[,;:—–-]+\s*$/, '').trim()
+  return trimmed.endsWith('.') ? trimmed : trimmed + '.'
+}
+
 function buildConversationBullet(c: ConversationOut, cap: number): string | null {
   if (!c.author || !c.channel || !c.summary || !c.permalink) return null
   const channel = c.channel.replace(/^#/, '')
@@ -337,6 +377,19 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
   if (data.conversations.length === 0 && data.intros.length === 0) return null
 
   console.log('[builder-bot] LLM raw output:', JSON.stringify(data, null, 2))
+
+  // Programmatic compression: the LLM consistently overshoots hard-max budgets
+  // ("HARD MAX 160" still produced 196). Trim post-hoc to keep bullets near
+  // Brian's ~250-char spec target. Both summary and replier are compressed
+  // independently; we never truncate mid-word — only at sentence/word
+  // boundaries — so output stays grammatical.
+  for (const c of data.conversations) {
+    if (c.summary) c.summary = compressByPeriodOrWord(c.summary, 165)
+    if (c.replier_sentence) c.replier_sentence = compressByPeriodOrWord(c.replier_sentence, 135)
+  }
+  for (const i of data.intros) {
+    if (i.summary) i.summary = compressByPeriodOrWord(i.summary, 200)
+  }
 
   // Deterministic fallback: if the LLM omitted replier_sentence on a convo
   // that has resolved replier names in the candidate input, fill it in from
