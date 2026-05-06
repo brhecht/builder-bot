@@ -49,14 +49,19 @@ TOP CONVERSATIONS RULES
 - Rank by reply count + reactions.
 - Author = Slack display name verbatim from the input. Do not abbreviate.
 - summary = exactly two sentences with two PERIODS. Concrete nouns and verbs.
-  TARGET 100–130 characters. Cut adjectives, qualifiers, and parentheticals
-  to fit. Never use semicolons as periods. Never write run-on sentences
-  with "while also", "alongside", or commas joining four ideas. Two clean
+  HARD MAX 160 characters. Brian's reference sample runs ~150 chars per
+  summary (175 was the longest). Cut adjectives, qualifiers, and
+  parentheticals to fit. If your draft exceeds 160 chars, rewrite it
+  shorter — do not submit anything over 160.
+  Never use semicolons as periods. Never write run-on sentences with
+  "while also", "alongside", or commas joining four ideas. Two clean
   short sentences.
   Don't open the summary by re-stating the author's name — they're already
   in the bullet header. Lead with the verb: "Argues that…", "Shipped a…",
   "Links a piece arguing…", not "Brian posted that…".
-- replier_sentence: ONE short sentence. TARGET 80–110 characters.
+- replier_sentence: ONE short sentence. HARD MAX 130 characters.
+  Brian's reference replier sentences run ~125 chars. Do NOT submit
+  anything over 130 chars.
   REQUIRED whenever the candidate has substantive replies AND at least one
   replier name is resolved (not "(name unresolved)" or empty).
 
@@ -81,9 +86,9 @@ TOP CONVERSATIONS RULES
 - Permalink: use the candidate's permalink verbatim. Do not modify.
 
 DIVISION OF RESPONSIBILITY: You return the data. The assembler formats the
-bullet and only drops the replier sentence if the bullet would exceed ~500
-chars. Brian's reference sample runs ~410 chars per bullet, so write
-content-rich tight prose, not over-compressed shorthand.
+bullet and drops the replier sentence if the bullet would exceed ~360
+chars. The spec target is ~250 chars per conversation; with summary 160 +
+replier 130 + permalink 65 + header 38 we land near 360 max.
 
 INTRO RULES
 - Source: ONLY #introductions messages whose AUTHOR display name is
@@ -99,8 +104,8 @@ INTRO RULES
 - Dedup: if the same author posted multiple intro messages, concatenate
   them and return ONE entry. The author's display name is the dedup key.
 - first_name = author's first name only. Strip last name. Strip emojis.
-- summary = exactly two sentences with TWO PERIODS. HARD LENGTH BUDGET:
-  220 characters MAX (count them). One sentence for the resume/credential
+- summary = exactly two sentences with TWO PERIODS. HARD MAX 180 characters.
+  Brian's reference intros run ~130 chars per summary (140 max). One sentence for the resume/credential
   signal (current role + most relevant career fact). One sentence for why
   they're in TNB (what they want to learn, build, or share).
   PUNCTUATION RULES (strict):
@@ -259,14 +264,13 @@ ${introBlock}`
 function assemblePost(data: RecapData, dateStr: string): string {
   const lines: string[] = [`*Top Conversations* — ${dateStr}`]
 
-  // Top Conversations: blank line between items. Soft cap 500 chars per
-  // bullet — failsafe, not target. Brian's May 5 reference sample bullets
-  // run ~410 chars; with both summary and replier at content-rich length
-  // we comfortably need ~440. The LLM aims tighter via prompt budgets;
-  // this cap only kicks in to drop replier on extreme overflow.
+  // Top Conversations: blank line between items. Cap 360 chars per bullet
+  // (Brian's spec target: ~250; sample varies 330-470 but spec/v2 fix
+  // table both say ~250 explicitly). Cap pushes us toward the target while
+  // accommodating content-rich content. Drops replier_sentence to fit.
   const convoBullets: string[] = []
   for (const c of data.conversations) {
-    const bullet = buildConversationBullet(c, 500)
+    const bullet = buildConversationBullet(c, 360)
     if (bullet) convoBullets.push(bullet)
   }
   if (convoBullets.length > 0) {
