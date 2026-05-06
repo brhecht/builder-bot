@@ -59,9 +59,19 @@ TOP CONVERSATIONS RULES
   Don't open the summary by re-stating the author's name — they're already
   in the bullet header. Lead with the verb: "Argues that…", "Shipped a…",
   "Links a piece arguing…", not "Brian posted that…".
-- replier_sentence: ONE short sentence. HARD MAX 130 characters.
-  Brian's reference replier sentences run ~125 chars. Do NOT submit
-  anything over 130 chars.
+- replier_sentence: One or two short sentences. HARD MAX 160 characters
+  TOTAL. Brian's reference replier sentences run ~125 chars (one sentence)
+  but if content is rich, break into TWO short sentences rather than
+  cramming into one and ending mid-thought.
+  WRONG: "Scott Werner replied that LLMs work best as patient teachers
+  once you develop the self-awareness to isolate exactly what you don't
+  understand and ask targeted questions." (one run-on sentence)
+  WRONG: "Scott Werner replied that treating the LLM as a patient teacher
+  helps, but most people haven't developed the skill of." (truncated
+  ungrammatically — never end mid-clause like "skill of.")
+  RIGHT: "Scott Werner replied that LLMs work best as patient teachers.
+  The hard skill is isolating what you don't understand." (~120 chars,
+  two clean sentences)
   REQUIRED whenever the candidate has substantive replies AND at least one
   replier name is resolved (not "(name unresolved)" or empty).
 
@@ -292,13 +302,9 @@ function assemblePost(data: RecapData, dateStr: string): string {
 }
 
 /**
- * Compress a string to <= maxLen by:
- *   1. If already <= maxLen, return as-is.
- *   2. Try keeping only the first sentence (split on ". " then prefer the
- *      longest prefix of full sentences that fits).
- *   3. If even one sentence is too long, truncate to last word boundary
- *      under maxLen and append a period.
- * Always preserves grammatical sentences (never cuts mid-word).
+ * Compress to <= maxLen, preserving full sentences when possible and
+ * falling back to a clean word-boundary truncation. Used for summaries
+ * where a partial sentence is acceptable as a last resort.
  */
 function compressByPeriodOrWord(s: string, maxLen: number): string {
   const text = s.trim()
@@ -329,6 +335,36 @@ function compressByPeriodOrWord(s: string, maxLen: number): string {
   const head = text.slice(0, maxLen - 1)
   const trimmed = head.replace(/\s+\S*$/, '').replace(/[,;:—–-]+\s*$/, '').trim()
   return trimmed.endsWith('.') ? trimmed : trimmed + '.'
+}
+
+/**
+ * Compress to <= maxLen, but ONLY at full-sentence boundaries. Returns
+ * empty string if no full sentence fits — caller decides what to do
+ * (typically: drop the field rather than show a fragment). Used for
+ * replier_sentence where a half-sentence reads as broken text.
+ */
+function compressBySentenceOnly(s: string, maxLen: number): string {
+  const text = s.trim()
+  if (text.length <= maxLen) return text
+
+  const sentences: string[] = []
+  let buf = ''
+  for (let i = 0; i < text.length; i++) {
+    buf += text[i]
+    if (text[i] === '.' && (i === text.length - 1 || /\s[A-Z]/.test(text.slice(i + 1, i + 3)))) {
+      sentences.push(buf.trim())
+      buf = ''
+    }
+  }
+  if (buf.trim()) sentences.push(buf.trim())
+
+  let acc = ''
+  for (const sent of sentences) {
+    const next = acc ? `${acc} ${sent}` : sent
+    if (next.length > maxLen) break
+    acc = next
+  }
+  return acc
 }
 
 function buildConversationBullet(c: ConversationOut, cap: number): string | null {
@@ -385,10 +421,24 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
   // boundaries — so output stays grammatical.
   for (const c of data.conversations) {
     if (c.summary) c.summary = compressByPeriodOrWord(c.summary, 165)
-    if (c.replier_sentence) c.replier_sentence = compressByPeriodOrWord(c.replier_sentence, 135)
+    if (c.replier_sentence) {
+      // Replier: compress at sentence boundary only. If we'd have to cut
+      // mid-clause (no clean period inside the budget), drop the replier
+      // entirely — fallback below will rebuild it cleaner.
+      // Also detect mid-clause endings the LLM might emit (e.g.
+      // "...the skill of." / "...because of." / "...thanks to.") and
+      // drop those as broken.
+      let r = compressBySentenceOnly(c.replier_sentence, 170)
+      if (r && /\b(of|to|for|with|in|on|at|by|from|as|that|the|a|an|and|or|but|because|while|since|until|though|although|after|before)\.\s*$/i.test(r)) {
+        r = '' // ends on a function word — broken sentence; let fallback rebuild
+      }
+      c.replier_sentence = r
+    }
   }
   for (const i of data.intros) {
-    if (i.summary) i.summary = compressByPeriodOrWord(i.summary, 200)
+    // Intros: keep both sentences when possible. Brian's reference intros
+    // run up to ~200 chars with 2 sentences; allow 230 before trimming.
+    if (i.summary) i.summary = compressByPeriodOrWord(i.summary, 230)
   }
 
   // Deterministic fallback: if the LLM omitted replier_sentence on a convo
@@ -411,15 +461,23 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
       console.log(`[builder-bot] fallback skip: ${candidate.user_name} has 0 resolved replies`)
       continue
     }
+    // Build fallback from the FIRST sentence of the first reply (so it's
+    // grammatical), prefixed with the replier's full name.
     const fullName = resolvedReplies[0].user_name!.trim()
-    const snippet = resolvedReplies[0].text
+    const cleanText = resolvedReplies[0].text
       .replace(/<[^>]+>/g, '')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 90)
-      .replace(/\s+\S*$/, '')
-      .replace(/[.!?]+$/, '')
-    c.replier_sentence = `${fullName} replied that ${snippet}.`
+    // Try to grab the first complete sentence if short enough; otherwise
+    // word-boundary truncate.
+    const periodMatch = cleanText.match(/^(.{20,140}?[.!?])\s/)
+    let core: string
+    if (periodMatch) {
+      core = periodMatch[1].replace(/[.!?]+$/, '')
+    } else {
+      core = cleanText.slice(0, 110).replace(/\s+\S*$/, '').replace(/[,;:—–-]+$/, '')
+    }
+    c.replier_sentence = `${fullName} replied that ${core.charAt(0).toLowerCase()}${core.slice(1)}.`
     console.log(`[builder-bot] fallback applied for ${c.author}: ${c.replier_sentence}`)
   }
 
