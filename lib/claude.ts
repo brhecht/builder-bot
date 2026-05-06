@@ -81,9 +81,9 @@ TOP CONVERSATIONS RULES
 - Permalink: use the candidate's permalink verbatim. Do not modify.
 
 DIVISION OF RESPONSIBILITY: You return the data. The assembler formats the
-bullet and caps at ~400 chars (dropping the replier sentence if needed).
-Brian's own May 5 reference sample runs ~400 chars per bullet, so don't
-over-compress. Write tight but complete sentences.
+bullet and only drops the replier sentence if the bullet would exceed ~500
+chars. Brian's reference sample runs ~410 chars per bullet, so write
+content-rich tight prose, not over-compressed shorthand.
 
 INTRO RULES
 - Source: ONLY #introductions messages whose AUTHOR display name is
@@ -259,14 +259,14 @@ ${introBlock}`
 function assemblePost(data: RecapData, dateStr: string): string {
   const lines: string[] = [`*Top Conversations* — ${dateStr}`]
 
-  // Top Conversations: blank line between items. Soft cap 400 chars per
-  // bullet — Brian's own May 5 sample runs ~400 chars per bullet (Scott
-  // Werner convo: ~410, Chuck convo: ~410). The "~250 chars" in his spec
-  // is aspirational; his real-world reference is ~400. Assembler drops
-  // replier sentence only if a bullet exceeds 400.
+  // Top Conversations: blank line between items. Soft cap 500 chars per
+  // bullet — failsafe, not target. Brian's May 5 reference sample bullets
+  // run ~410 chars; with both summary and replier at content-rich length
+  // we comfortably need ~440. The LLM aims tighter via prompt budgets;
+  // this cap only kicks in to drop replier on extreme overflow.
   const convoBullets: string[] = []
   for (const c of data.conversations) {
-    const bullet = buildConversationBullet(c, 400)
+    const bullet = buildConversationBullet(c, 500)
     if (bullet) convoBullets.push(bullet)
   }
   if (convoBullets.length > 0) {
@@ -305,13 +305,12 @@ function buildConversationBullet(c: ConversationOut, cap: number): string | null
 
 function buildIntroBullet(i: IntroOut): string | null {
   if (!i.first_name || !i.summary) return null
-  // Defensive: replace a semicolon used as a sentence break with ". " — the
-  // prompt bans this but the LLM still slips occasionally. Pattern: "; "
-  // followed by a lowercase letter or a capitalized word. We also collapse
-  // any double space that results.
+  // Defensive: replace a semicolon used as a sentence break with ". "
+  // and capitalize the first letter of the next clause. The prompt bans
+  // this but the LLM still slips occasionally. Also collapse double spaces.
   const summary = i.summary
     .trim()
-    .replace(/;\s+(?=[A-Za-z])/g, '. ')
+    .replace(/;\s+([a-zA-Z])/g, (_match, c: string) => `. ${c.toUpperCase()}`)
     .replace(/\s{2,}/g, ' ')
   const link = i.permalink ? ` ${i.permalink}` : ''
   return `• ${i.first_name} — ${summary}${link}`
