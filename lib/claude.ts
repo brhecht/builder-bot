@@ -271,7 +271,7 @@ ${introBlock}`
   return out
 }
 
-function assemblePost(data: RecapData, dateStr: string): string {
+function assemblePost(data: RecapData, dateStr: string, channelMap: Map<string, string>): string {
   const lines: string[] = [`*Top Conversations* — ${dateStr}`]
 
   // Top Conversations: blank line between items. Cap 360 chars per bullet
@@ -280,7 +280,7 @@ function assemblePost(data: RecapData, dateStr: string): string {
   // accommodating content-rich content. Drops replier_sentence to fit.
   const convoBullets: string[] = []
   for (const c of data.conversations) {
-    const bullet = buildConversationBullet(c, 360)
+    const bullet = buildConversationBullet(c, 360, channelMap)
     if (bullet) convoBullets.push(bullet)
   }
   if (convoBullets.length > 0) {
@@ -367,21 +367,23 @@ function compressBySentenceOnly(s: string, maxLen: number): string {
   return acc
 }
 
-function buildConversationBullet(c: ConversationOut, cap: number): string | null {
+function buildConversationBullet(c: ConversationOut, cap: number, channelMap: Map<string, string>): string | null {
   if (!c.author || !c.channel || !c.summary || !c.permalink) return null
   const channel = c.channel.replace(/^#/, '')
   const summary = c.summary.trim()
   const replier = (c.replier_sentence ?? '').trim()
 
   // The permalink lives inline behind the author name as a Slack mrkdwn
-  // hyperlink: `<URL|Author>`. The raw URL never appears in the rendered
-  // message (no unfurl/preview ruido) but clicking the author still opens
-  // the thread. Brian's preference (May 6 PM) was no visible URLs.
+  // hyperlink (no visible URL, no unfurl preview). Channel is rendered as
+  // a Slack channel mention `<#ID|name>` when we have the ID — Slack
+  // renders that as a clickable `#channel-name`.
   const authorLink = `<${c.permalink}|${c.author}>`
+  const channelId = channelMap.get(channel)
+  const channelLink = channelId ? `<#${channelId}|${channel}>` : `#${channel}`
 
-  const bulletWithReplier = `• ${authorLink} (#${channel}) — ${summary}${replier ? ' ' + replier : ''}`
+  const bulletWithReplier = `• ${authorLink} (${channelLink}) — ${summary}${replier ? ' ' + replier : ''}`
   if (bulletWithReplier.length <= cap) return bulletWithReplier
-  return `• ${authorLink} (#${channel}) — ${summary}`
+  return `• ${authorLink} (${channelLink}) — ${summary}`
 }
 
 function buildIntroBullet(i: IntroOut): string | null {
@@ -483,5 +485,14 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
     console.log(`[builder-bot] fallback applied for ${c.author}: ${c.replier_sentence}`)
   }
 
-  return assemblePost(data, input.dateStr)
+  // Map channel_name → channel_id so the assembler can render Slack
+  // channel mentions (`<#ID|name>`) for clickable channel links.
+  const channelMap = new Map<string, string>()
+  for (const cand of input.conversations) {
+    if (cand.channel_name && cand.channel_id) {
+      channelMap.set(cand.channel_name, cand.channel_id)
+    }
+  }
+
+  return assemblePost(data, input.dateStr, channelMap)
 }
