@@ -121,6 +121,12 @@ export async function postMessage(channelId: string, text: string): Promise<void
     text,
     username: 'Builder Bot',
     icon_emoji: ':hammer_and_wrench:',
+    // Brian (May 6 PM) doesn't want unfurl previews under each item — the
+    // visual noise broke the scannable design. Permalinks now live inline
+    // as <URL|Author> hyperlinks; these flags suppress any preview Slack
+    // would otherwise generate.
+    unfurl_links: false,
+    unfurl_media: false,
   })
 }
 

@@ -373,14 +373,15 @@ function buildConversationBullet(c: ConversationOut, cap: number): string | null
   const summary = c.summary.trim()
   const replier = (c.replier_sentence ?? '').trim()
 
-  // Author is PLAIN per Brian's spec ("use *bold* for the header and section
-  // header" — only those, not authors). His sample shows plain author too.
-  // Strategy: never truncate mid-sentence (those "…" cuts read as broken
-  // text). If the bullet exceeds the cap with replier included, drop the
-  // replier. If it still exceeds, return the full summary anyway.
-  const bulletWithReplier = `• ${c.author} (#${channel}) — ${summary}${replier ? ' ' + replier : ''} ${c.permalink}`
+  // The permalink lives inline behind the author name as a Slack mrkdwn
+  // hyperlink: `<URL|Author>`. The raw URL never appears in the rendered
+  // message (no unfurl/preview ruido) but clicking the author still opens
+  // the thread. Brian's preference (May 6 PM) was no visible URLs.
+  const authorLink = `<${c.permalink}|${c.author}>`
+
+  const bulletWithReplier = `• ${authorLink} (#${channel}) — ${summary}${replier ? ' ' + replier : ''}`
   if (bulletWithReplier.length <= cap) return bulletWithReplier
-  return `• ${c.author} (#${channel}) — ${summary} ${c.permalink}`
+  return `• ${authorLink} (#${channel}) — ${summary}`
 }
 
 function buildIntroBullet(i: IntroOut): string | null {
@@ -392,8 +393,9 @@ function buildIntroBullet(i: IntroOut): string | null {
     .trim()
     .replace(/;\s+([a-zA-Z])/g, (_match, c: string) => `. ${c.toUpperCase()}`)
     .replace(/\s{2,}/g, ' ')
-  const link = i.permalink ? ` ${i.permalink}` : ''
-  return `• ${i.first_name} — ${summary}${link}`
+  // Permalink lives inline behind the first name as a Slack mrkdwn hyperlink.
+  const nameLabel = i.permalink ? `<${i.permalink}|${i.first_name}>` : i.first_name
+  return `• ${nameLabel} — ${summary}`
 }
 
 export async function generateRecap(input: GenerateInput): Promise<string | null> {
