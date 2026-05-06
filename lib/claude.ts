@@ -56,11 +56,17 @@ TOP CONVERSATIONS RULES
   Don't open the summary by re-stating the author's name — they're already
   in the bullet header. Lead with the verb: "Argues that…", "Shipped a…",
   "Links a piece arguing…", not "Brian posted that…".
-- replier_sentence: ONE short sentence. HARD LENGTH BUDGET: 80 characters MAX.
+- replier_sentence: ONE short sentence. HARD LENGTH BUDGET: 110 characters MAX.
+  REQUIRED whenever the candidate has substantive replies AND at least one
+  replier name is resolved (not "(name unresolved)" or empty). Do not omit
+  it just because the budget feels tight — write it tighter, but include it.
   Options:
    • "Tom Marks replied that …" (single replier)
    • "Tom Marks and Iris ten Teije noted …" (multiple repliers, similar points)
-   • null (no substantive replies, OR replier name unresolved)
+   • null ONLY if (a) zero substantive replies, OR (b) every replier name
+     in the input is unresolved.
+  Substantive = adds an idea, pushback, or new angle. Banter, "+1",
+  emoji-only, or single-word "agreed" reactions are not substantive.
 - NEVER write "one user noted", "a reply pushed", "someone replied",
   "Replies push the idea further", or any framing that strips the
   replier's identity. If the name field is "(name unresolved)" or empty,
@@ -90,11 +96,19 @@ INTRO RULES
   220 characters MAX (count them). One sentence for the resume/credential
   signal (current role + most relevant career fact). One sentence for why
   they're in TNB (what they want to learn, build, or share).
+  PUNCTUATION RULES (strict):
+   • Use periods between sentences. Never semicolons. ";" is banned —
+     replace with ". " always.
+   • Never use a semicolon to link two independent clauses. "Seeking BD
+     roles; exploring AI tools." is wrong; rewrite as "Seeking BD roles.
+     Exploring AI tools." or merge into one tight clause.
   BANNED CONNECTORS: "while also", "while serving as", "alongside", "as well
   as", "in addition to". These produce run-ons. Use a period instead.
-  BANNED: stacking 3+ items with commas inside a single sentence (e.g.
-  "across tourism, youth development, and film, plus venture work and…").
-  Pick the strongest one or two facts and cut the rest.
+  Comma-separated lists of up to 3 items inside a sentence are fine
+  (Brian's own sample uses "across product design, compliance, and CRM at
+  Moon"). What's NOT fine is chaining a 3-item list onto another clause
+  with another conjunction (e.g. "...across X, Y, and Z, plus venture
+  work and...").
   Sample tone: "CMO of Tire Agent, scaled it into a top online tire
   retailer. Now deploying AI across the marketing stack, workflows, and
   analytics." Two periods. Two clean sentences.
@@ -216,12 +230,13 @@ ${introBlock}`
 function assemblePost(data: RecapData, dateStr: string): string {
   const lines: string[] = [`*Top Conversations* — ${dateStr}`]
 
-  // Top Conversations: blank line between items. Soft cap ~280 chars per
-  // bullet; assembler drops replier sentence to fit but never truncates
-  // summary mid-sentence.
+  // Top Conversations: blank line between items. Soft cap ~320 chars per
+  // bullet (Brian's own sample runs ~400 chars; ~250 in spec is aspirational
+  // but his sample exceeds it 1.5×). Assembler drops replier sentence only
+  // if needed; never truncates summary mid-sentence.
   const convoBullets: string[] = []
   for (const c of data.conversations) {
-    const bullet = buildConversationBullet(c, 280)
+    const bullet = buildConversationBullet(c, 320)
     if (bullet) convoBullets.push(bullet)
   }
   if (convoBullets.length > 0) {
@@ -248,20 +263,26 @@ function buildConversationBullet(c: ConversationOut, cap: number): string | null
   const summary = c.summary.trim()
   const replier = (c.replier_sentence ?? '').trim()
 
+  // Author is PLAIN per Brian's spec ("use *bold* for the header and section
+  // header" — only those, not authors). His sample shows plain author too.
   // Strategy: never truncate mid-sentence (those "…" cuts read as broken
   // text). If the bullet exceeds the cap with replier included, drop the
-  // replier. If it still exceeds, return the full summary anyway — better
-  // a slightly long bullet than a mangled one. The prompt is responsible
-  // for keeping summaries <=130 chars; long bullets here mean the LLM
-  // overshot and we accept it as a soft fail.
-  const bulletWithReplier = `• *${c.author}* (#${channel}) — ${summary}${replier ? ' ' + replier : ''} ${c.permalink}`
+  // replier. If it still exceeds, return the full summary anyway.
+  const bulletWithReplier = `• ${c.author} (#${channel}) — ${summary}${replier ? ' ' + replier : ''} ${c.permalink}`
   if (bulletWithReplier.length <= cap) return bulletWithReplier
-  return `• *${c.author}* (#${channel}) — ${summary} ${c.permalink}`
+  return `• ${c.author} (#${channel}) — ${summary} ${c.permalink}`
 }
 
 function buildIntroBullet(i: IntroOut): string | null {
   if (!i.first_name || !i.summary) return null
-  const summary = i.summary.trim()
+  // Defensive: replace a semicolon used as a sentence break with ". " — the
+  // prompt bans this but the LLM still slips occasionally. Pattern: "; "
+  // followed by a lowercase letter or a capitalized word. We also collapse
+  // any double space that results.
+  const summary = i.summary
+    .trim()
+    .replace(/;\s+(?=[A-Za-z])/g, '. ')
+    .replace(/\s{2,}/g, ' ')
   const link = i.permalink ? ` ${i.permalink}` : ''
   return `• ${i.first_name} — ${summary}${link}`
 }

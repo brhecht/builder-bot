@@ -286,6 +286,10 @@ export async function GET(req: NextRequest) {
         channel: c.channel_name,
         replies: c.reply_count,
         first_120: c.text.slice(0, 120),
+        replies_preview: c.replies.map((r) => ({
+          replier: r.user_name ?? '(unresolved)',
+          first_80: r.text.slice(0, 80),
+        })),
       })),
     })
   }
