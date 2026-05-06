@@ -275,6 +275,18 @@ export async function GET(req: NextRequest) {
       intros: allIntros.length,
       date: dateStr,
       preview: post,
+      // Diagnostic: list each candidate so we can verify what the LLM
+      // received and which intros it dropped (welcomes vs. self-intros).
+      _intros_in: allIntros.map((i) => ({
+        author: i.user_name,
+        first_120: i.raw_text.slice(0, 120),
+      })),
+      _convos_in: allCandidates.map((c) => ({
+        author: c.user_name,
+        channel: c.channel_name,
+        replies: c.reply_count,
+        first_120: c.text.slice(0, 120),
+      })),
     })
   }
 

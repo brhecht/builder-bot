@@ -48,23 +48,29 @@ TOP CONVERSATIONS RULES
   worth surfacing on their own.
 - Rank by reply count + reactions.
 - Author = Slack display name verbatim from the input. Do not abbreviate.
-- summary = exactly two sentences. Two periods. No semicolons substituting
-  for periods. Concrete nouns and verbs. Cut adjectives.
-- summary + replier_sentence + permalink will be assembled into a single
-  bullet capped at 250 characters total. Write conservatively. The
-  assembler will REJECT any conversation whose assembled bullet exceeds
-  the cap, so keep summary <= 180 chars and replier_sentence <= 120 chars.
-  Approximate budget: bullet = "• *Author* (#channel) — summary replier_sentence permalink"
-- replier_sentence options:
+- summary = exactly two sentences with two PERIODS. Concrete nouns and verbs.
+  HARD LENGTH BUDGET: 130 characters MAX (count them). Cut adjectives,
+  qualifiers, and parentheticals to fit. Never use semicolons as periods.
+  Never write run-on sentences with "while also", "alongside", or commas
+  joining four ideas. Two clean short sentences.
+  Don't open the summary by re-stating the author's name — they're already
+  in the bullet header. Lead with the verb: "Argues that…", "Shipped a…",
+  "Links a piece arguing…", not "Brian posted that…".
+- replier_sentence: ONE short sentence. HARD LENGTH BUDGET: 80 characters MAX.
+  Options:
    • "Tom Marks replied that …" (single replier)
-   • "Tom Marks and Iris ten Teije both noted …" (multiple repliers, similar
-     points — still name all of them)
+   • "Tom Marks and Iris ten Teije noted …" (multiple repliers, similar points)
    • null (no substantive replies, OR replier name unresolved)
 - NEVER write "one user noted", "a reply pushed", "someone replied",
   "Replies push the idea further", or any framing that strips the
   replier's identity. If the name field is "(name unresolved)" or empty,
   set replier_sentence to null.
 - Permalink: use the candidate's permalink verbatim. Do not modify.
+
+The downstream assembler caps each bullet at ~280 chars. If your summary +
+replier blows past the budget, the assembler drops the replier sentence to
+keep the bullet readable. So WRITE TIGHT FROM THE START — don't rely on
+truncation, and never plan to overflow.
 
 INTRO RULES
 - Source: ONLY #introductions messages whose AUTHOR display name is
@@ -80,10 +86,18 @@ INTRO RULES
 - Dedup: if the same author posted multiple intro messages, concatenate
   them and return ONE entry. The author's display name is the dedup key.
 - first_name = author's first name only. Strip last name. Strip emojis.
-- summary = two sentences max combining (a) most relevant resume/credential
-  signal and (b) why they are in TNB. Two periods. No run-on sentences
-  with semicolons or "while also" / "alongside" / commas joining four
-  ideas. Two clean sentences. Cut to fit.
+- summary = exactly two sentences with TWO PERIODS. HARD LENGTH BUDGET:
+  220 characters MAX (count them). One sentence for the resume/credential
+  signal (current role + most relevant career fact). One sentence for why
+  they're in TNB (what they want to learn, build, or share).
+  BANNED CONNECTORS: "while also", "while serving as", "alongside", "as well
+  as", "in addition to". These produce run-ons. Use a period instead.
+  BANNED: stacking 3+ items with commas inside a single sentence (e.g.
+  "across tourism, youth development, and film, plus venture work and…").
+  Pick the strongest one or two facts and cut the rest.
+  Sample tone: "CMO of Tire Agent, scaled it into a top online tire
+  retailer. Now deploying AI across the marketing stack, workflows, and
+  analytics." Two periods. Two clean sentences.
 - Permalink: use the candidate's permalink verbatim.
 
 TONE RULES (apply to summary and replier_sentence)
@@ -202,12 +216,12 @@ ${introBlock}`
 function assemblePost(data: RecapData, dateStr: string): string {
   const lines: string[] = [`*Top Conversations* — ${dateStr}`]
 
-  // Top Conversations: blank line between items, hard 250-char cap per bullet.
-  // If a bullet exceeds the cap, drop the replier sentence first; if still
-  // over, truncate the summary on a word boundary.
+  // Top Conversations: blank line between items. Soft cap ~280 chars per
+  // bullet; assembler drops replier sentence to fit but never truncates
+  // summary mid-sentence.
   const convoBullets: string[] = []
   for (const c of data.conversations) {
-    const bullet = buildConversationBullet(c, 250)
+    const bullet = buildConversationBullet(c, 280)
     if (bullet) convoBullets.push(bullet)
   }
   if (convoBullets.length > 0) {
@@ -234,24 +248,15 @@ function buildConversationBullet(c: ConversationOut, cap: number): string | null
   const summary = c.summary.trim()
   const replier = (c.replier_sentence ?? '').trim()
 
-  let bullet = `• *${c.author}* (#${channel}) — ${summary}${replier ? ' ' + replier : ''} ${c.permalink}`
-  if (bullet.length <= cap) return bullet
-
-  // Drop replier first
-  bullet = `• *${c.author}* (#${channel}) — ${summary} ${c.permalink}`
-  if (bullet.length <= cap) return bullet
-
-  // Truncate summary on a word boundary, leaving room for "… " + permalink
-  const head = `• *${c.author}* (#${channel}) — `
-  const tailLen = c.permalink.length + 2 // space + permalink
-  const summaryBudget = cap - head.length - tailLen - 1 // -1 for ellipsis space
-  if (summaryBudget < 40) {
-    // Author + channel + permalink alone already too long; keep raw bullet
-    // (rare; LLM should not produce). Return uncapped — better than nothing.
-    return `• *${c.author}* (#${channel}) — ${summary} ${c.permalink}`
-  }
-  const truncated = summary.slice(0, summaryBudget).replace(/\s+\S*$/, '').trim() + '…'
-  return `${head}${truncated} ${c.permalink}`
+  // Strategy: never truncate mid-sentence (those "…" cuts read as broken
+  // text). If the bullet exceeds the cap with replier included, drop the
+  // replier. If it still exceeds, return the full summary anyway — better
+  // a slightly long bullet than a mangled one. The prompt is responsible
+  // for keeping summaries <=130 chars; long bullets here mean the LLM
+  // overshot and we accept it as a soft fail.
+  const bulletWithReplier = `• *${c.author}* (#${channel}) — ${summary}${replier ? ' ' + replier : ''} ${c.permalink}`
+  if (bulletWithReplier.length <= cap) return bulletWithReplier
+  return `• *${c.author}* (#${channel}) — ${summary} ${c.permalink}`
 }
 
 function buildIntroBullet(i: IntroOut): string | null {
