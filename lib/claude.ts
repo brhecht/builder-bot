@@ -170,11 +170,28 @@ function formatConversation(c: ConversationCandidate, index: number, maxReplies 
     .sort((a, b) => b.text.length - a.text.length)
     .slice(0, maxReplies)
 
+  const resolvedRepliers = Array.from(
+    new Set(
+      c.replies
+        .map((r) => r.user_name?.trim())
+        .filter((n): n is string => !!n && !n.toLowerCase().includes('unresolved'))
+    )
+  )
+
   const replyLines = replies.length > 0
     ? replies
         .map((r) => `  • ${r.user_name ? `${r.user_name}: ` : '(name unresolved) '}${r.text}`)
         .join('\n')
     : '  (none)'
+
+  // Per-conversation hard instruction. The system prompt says replier_sentence
+  // is required when valid replies exist, but the LLM still self-censors
+  // periodically. Annotating each conversation directly closes that gap.
+  const replierInstruction = resolvedRepliers.length > 0
+    ? `\nINSTRUCTION FOR THIS CONVERSATION: ${resolvedRepliers.length} resolved replier name(s) — ${resolvedRepliers.join(', ')}. Your JSON output for THIS conversation MUST set "replier_sentence" to a non-null sentence naming ${resolvedRepliers.length === 1 ? 'this person' : 'these people'} (one sentence summarizing what they added). Returning null here is a hard violation.`
+    : (c.reply_count > 0
+        ? '\nINSTRUCTION FOR THIS CONVERSATION: replies exist but no display names were resolved by Slack — set replier_sentence to null per spec.'
+        : '\nINSTRUCTION FOR THIS CONVERSATION: zero replies — set replier_sentence to null.')
 
   return `--- Conversation ${index + 1} ---
 Channel: #${c.channel_name}
@@ -184,7 +201,7 @@ Permalink: ${c.permalink}
 Post: ${c.text}
 ${c.url_content ? `Linked URL content (truncated): ${c.url_content.slice(0, maxUrl)}` : '(no linked URL)'}
 Replies (most substantive first, with replier display name):
-${replyLines}`
+${replyLines}${replierInstruction}`
 }
 
 function formatIntro(i: IntroCandidate, index: number): string {
@@ -309,6 +326,30 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
   }
 
   if (data.conversations.length === 0 && data.intros.length === 0) return null
+
+  // Deterministic fallback: if the LLM omitted replier_sentence on a convo
+  // that has resolved replier names in the candidate input, fill it in from
+  // the first substantive reply. The LLM is supposed to do this; the fallback
+  // is a guard for when it self-censors anyway.
+  for (const c of data.conversations) {
+    if (c.replier_sentence) continue
+    const candidate = input.conversations.find((cc) => cc.permalink === c.permalink)
+    if (!candidate) continue
+    const resolvedReplies = candidate.replies.filter(
+      (r) => r.user_name && !r.user_name.toLowerCase().includes('unresolved')
+    )
+    if (resolvedReplies.length === 0) continue
+    // Spec: full names in Top Conversations (post authors AND repliers).
+    const fullName = resolvedReplies[0].user_name!.trim()
+    const snippet = resolvedReplies[0].text
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 90)
+      .replace(/\s+\S*$/, '')
+      .replace(/[.!?]+$/, '')
+    c.replier_sentence = `${fullName} replied that ${snippet}.`
+  }
 
   return assemblePost(data, input.dateStr)
 }
