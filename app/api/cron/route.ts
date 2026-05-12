@@ -309,8 +309,18 @@ export async function GET(req: NextRequest) {
       // received and which intros it dropped (welcomes vs. self-intros).
       _intros_in: allIntros.map((i) => ({
         author: i.user_name,
+        ts: i.ts,
         first_120: i.raw_text.slice(0, 120),
       })),
+      _intros_raw: introResult.status === 'fulfilled'
+        ? introResult.value.map((m) => ({
+            ts: m.ts,
+            user: m.user,
+            reply_count: m.reply_count ?? 0,
+            text_len: (m.text ?? '').length,
+            first_80: (m.text ?? '').slice(0, 80),
+          }))
+        : `error: ${introResult.reason}`,
       _convos_in: allCandidates.map((c) => ({
         author: c.user_name,
         channel: c.channel_name,
