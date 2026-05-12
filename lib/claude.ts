@@ -101,14 +101,19 @@ chars. The spec target is ~250 chars per conversation; with summary 160 +
 replier 130 + permalink 65 + header 38 we land near 360 max.
 
 INTRO RULES
-- Source: ONLY #introductions messages whose AUTHOR display name is
-  plausibly the same person being introduced (a self-intro). Welcomes
-  and third-party introductions are EXCLUDED — even though they may
-  appear in the candidate list.
-- Identifying a welcome: phrases like "everyone, please welcome…",
-  "@person — glad you're here", or where the message describes someone
-  in third person while the author is a different name. When in doubt,
-  drop it.
+- Source: each candidate carries an AUTHOR display name. Use the
+  AUTHOR as the subject of the intro you write — even if the message
+  text is a welcome or third-party introduction. The system pre-resolves
+  candidates so a welcome from Brian about Amr arrives as TWO candidates:
+  one with AUTHOR=Brian (drop — Brian is not new) and one with
+  AUTHOR=Amr (KEEP — Amr is the welcomed person). When you see a
+  candidate whose AUTHOR is the subject described in the body, generate
+  the intro for that subject, drawing from the body text regardless of
+  whether the wording is first-person ("I'm Amr…") or third-person
+  ("Amr is a product leader…").
+- Drop a candidate whose AUTHOR is clearly NOT the subject of the body
+  (e.g. AUTHOR=Brian, body welcomes Amr — Brian is not the new member).
+  When in doubt, keep it.
 - No count cap on legitimate self-intros. If 8 people self-introduced
   yesterday, return all 8.
 - Dedup: if the same author posted multiple intro messages, concatenate

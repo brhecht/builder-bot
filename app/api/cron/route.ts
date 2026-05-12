@@ -120,18 +120,46 @@ export async function GET(req: NextRequest) {
   // introduced) surface it correctly. Without this, welcomed-then-replied
   // members were getting dropped silently (Brian feedback May 11).
   const introCandidates: IntroCandidate[] = []
+  const introSeen = new Set<string>() // dedup key: `${user_id}:${ts}`
   if (introResult.status === 'fulfilled') {
     for (const msg of introResult.value) {
       if (msg.text && msg.text.length >= 80) {
         const userId = msg.user ?? msg.username ?? 'unknown'
         const userName = await getUserName(userId)
-        introCandidates.push({
-          ts: msg.ts,
-          raw_text: msg.text,
-          user_id: userId,
-          user_name: userName,
-          permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, msg.ts),
-        })
+        const key = `${userId}:${msg.ts}`
+        if (!introSeen.has(key)) {
+          introSeen.add(key)
+          introCandidates.push({
+            ts: msg.ts,
+            raw_text: msg.text,
+            user_id: userId,
+            user_name: userName,
+            permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, msg.ts),
+          })
+        }
+
+        // Welcome surfacing: when a message mentions another user via
+        // <@USERID> in the first 200 chars and is substantive, also emit a
+        // candidate keyed by the welcomed person. The LLM's self-intro
+        // filter sees author == subject of the welcome and surfaces them
+        // even if they haven't self-introduced yet (Brian feedback May 11:
+        // welcomes should let new members appear in the recap immediately).
+        const mentionMatch = msg.text.slice(0, 200).match(/<@([A-Z0-9]+)>/)
+        if (mentionMatch && mentionMatch[1] !== userId) {
+          const mentionedId = mentionMatch[1]
+          const mentionedName = await getUserName(mentionedId)
+          const mKey = `${mentionedId}:${msg.ts}`
+          if (!introSeen.has(mKey)) {
+            introSeen.add(mKey)
+            introCandidates.push({
+              ts: msg.ts,
+              raw_text: msg.text,
+              user_id: mentionedId,
+              user_name: mentionedName,
+              permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, msg.ts),
+            })
+          }
+        }
       }
 
       // Thread replies inside #introduce-yourself: each reply ≥80 chars becomes
@@ -146,13 +174,17 @@ export async function GET(req: NextRequest) {
           const replierName = reply.user_name && !reply.user_name.toLowerCase().includes('unresolved')
             ? reply.user_name
             : await getUserName(replierId)
-          introCandidates.push({
-            ts: reply.ts,
-            raw_text: reply.text,
-            user_id: replierId,
-            user_name: replierName,
-            permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, reply.ts),
-          })
+          const key = `${replierId}:${reply.ts}`
+          if (!introSeen.has(key)) {
+            introSeen.add(key)
+            introCandidates.push({
+              ts: reply.ts,
+              raw_text: reply.text,
+              user_id: replierId,
+              user_name: replierName,
+              permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, reply.ts),
+            })
+          }
         }
       }
     }
@@ -309,18 +341,8 @@ export async function GET(req: NextRequest) {
       // received and which intros it dropped (welcomes vs. self-intros).
       _intros_in: allIntros.map((i) => ({
         author: i.user_name,
-        ts: i.ts,
         first_120: i.raw_text.slice(0, 120),
       })),
-      _intros_raw: introResult.status === 'fulfilled'
-        ? introResult.value.map((m) => ({
-            ts: m.ts,
-            user: m.user,
-            reply_count: m.reply_count ?? 0,
-            text_len: (m.text ?? '').length,
-            first_80: (m.text ?? '').slice(0, 80),
-          }))
-        : `error: ${introResult.reason}`,
       _convos_in: allCandidates.map((c) => ({
         author: c.user_name,
         channel: c.channel_name,
