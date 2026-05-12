@@ -112,19 +112,49 @@ export async function GET(req: NextRequest) {
   // 3. Build intro candidates with author + permalink. v2 prompt enforces the
   // self-intro filter (drops welcomes / third-party intros) so we pass author
   // metadata through; we still pre-trim very short messages to save tokens.
+  //
+  // Also fetch thread replies under each top-level message — when a founder
+  // posts "Friends, please welcome @X" and X self-introduces in the thread,
+  // X's reply IS the self-intro. Treating it as a top-level intro candidate
+  // lets the prompt's existing self-intro filter (author == person being
+  // introduced) surface it correctly. Without this, welcomed-then-replied
+  // members were getting dropped silently (Brian feedback May 11).
   const introCandidates: IntroCandidate[] = []
   if (introResult.status === 'fulfilled') {
     for (const msg of introResult.value) {
-      if (!msg.text || msg.text.length < 80) continue
-      const userId = msg.user ?? msg.username ?? 'unknown'
-      const userName = await getUserName(userId)
-      introCandidates.push({
-        ts: msg.ts,
-        raw_text: msg.text,
-        user_id: userId,
-        user_name: userName,
-        permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, msg.ts),
-      })
+      if (msg.text && msg.text.length >= 80) {
+        const userId = msg.user ?? msg.username ?? 'unknown'
+        const userName = await getUserName(userId)
+        introCandidates.push({
+          ts: msg.ts,
+          raw_text: msg.text,
+          user_id: userId,
+          user_name: userName,
+          permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, msg.ts),
+        })
+      }
+
+      // Thread replies inside #introduce-yourself: each reply ≥80 chars becomes
+      // its own intro candidate keyed by the replier's name. The LLM's
+      // self-intro filter then keeps replies whose author == the person being
+      // welcomed and drops congratulatory replies from existing members.
+      if (msg.reply_count && msg.reply_count > 0) {
+        const threadReplies = await getThreadReplies(CHANNELS.INTRODUCE_YOURSELF, msg.ts)
+        for (const reply of threadReplies) {
+          if (!reply.text || reply.text.length < 80) continue
+          const replierId = reply.user ?? reply.username ?? 'unknown'
+          const replierName = reply.user_name && !reply.user_name.toLowerCase().includes('unresolved')
+            ? reply.user_name
+            : await getUserName(replierId)
+          introCandidates.push({
+            ts: reply.ts,
+            raw_text: reply.text,
+            user_id: replierId,
+            user_name: replierName,
+            permalink: makeDeepLink(CHANNELS.INTRODUCE_YOURSELF, reply.ts),
+          })
+        }
+      }
     }
   } else {
     log(`#introduce-yourself unavailable: ${introResult.reason}`)
