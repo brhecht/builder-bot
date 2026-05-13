@@ -6,6 +6,8 @@ import {
   getPendingIntros,
   setPendingIntros,
   clearPendingIntros,
+  getLastPostedKeys,
+  setLastPostedKeys,
 } from '@/lib/kv'
 import {
   getChannelMessages,
@@ -70,6 +72,12 @@ export async function GET(req: NextRequest) {
   const lookbackHours = lookbackHoursParam ? parseFloat(lookbackHoursParam) : null
   const now = DateTime.now().setZone('America/Bogota')
   if (!isTest) {
+    // Luxon: weekday 1=Mon … 7=Sun. Brian (May 13 PM) wants the recap every day
+    // EXCEPT Sundays — keep Sunday quiet so Monday's post lands fresh.
+    if (now.weekday === 7) {
+      log('Skipping — Sunday')
+      return NextResponse.json({ skipped: 'sunday' })
+    }
     if (now.hour < 8 || now.hour >= 9) {
       log(`Skipping — outside 8–9 AM Bogotá window (current: ${now.toFormat('HH:mm z')})`)
       return NextResponse.json({ skipped: 'outside-window' })
@@ -84,10 +92,16 @@ export async function GET(req: NextRequest) {
   const convChannels = [CHANNELS.SHARE_AND_DISCUSS, CHANNELS.WHAT_IM_BUILDING, CHANNELS.GENERAL]
   const allChannels = [CHANNELS.INTRODUCE_YOURSELF, ...convChannels]
 
-  const [pendingIntros, ...lastTimestamps] = await Promise.all([
+  const [pendingIntros, lastPostedKeys, ...lastTimestamps] = await Promise.all([
     getPendingIntros(),
+    getLastPostedKeys(),
     ...allChannels.map((ch) => getLastReported(ch)),
   ])
+
+  // Build a Set of permalinks + URLs that appeared in yesterday's recap so we
+  // can drop today's duplicates before they reach the LLM. Same thread or same
+  // shared link shouldn't be surfaced twice in a row.
+  const dedupSet = new Set(lastPostedKeys.filter(Boolean))
 
   const lastReported: Record<string, number> = {}
   allChannels.forEach((ch, i) => { lastReported[ch] = lastTimestamps[i] })
@@ -246,10 +260,19 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  const allCandidates: ConversationCandidate[] = [
+  const allCandidatesRaw: ConversationCandidate[] = [
     ...noUrlCandidates,
     ...Array.from(urlMap.values()).map((e) => e.candidate),
   ]
+
+  // Dedup against yesterday's posted keys (permalink OR url). Anything we
+  // surfaced yesterday is dropped from today's pool so the same thread/link
+  // doesn't appear twice in a row.
+  const allCandidates = allCandidatesRaw.filter(
+    (c) => !dedupSet.has(c.permalink) && !(c.url && dedupSet.has(c.url))
+  )
+  const droppedConvDupes = allCandidatesRaw.length - allCandidates.length
+  if (droppedConvDupes > 0) log(`Dedup: dropped ${droppedConvDupes} conversation candidate(s) seen yesterday`)
 
   const channelDiag: Record<string, number | string> = {}
   for (let i = 0; i < convChannels.length; i++) {
@@ -284,7 +307,24 @@ export async function GET(req: NextRequest) {
       permalink: p.permalink ?? '',
     }))
 
-  const allIntros: IntroCandidate[] = [...carriedIntroCandidates, ...introCandidates]
+  const allIntrosRaw: IntroCandidate[] = [...carriedIntroCandidates, ...introCandidates]
+  const allIntros: IntroCandidate[] = allIntrosRaw.filter(
+    (i) => !i.permalink || !dedupSet.has(i.permalink)
+  )
+  const droppedIntroDupes = allIntrosRaw.length - allIntros.length
+  if (droppedIntroDupes > 0) log(`Dedup: dropped ${droppedIntroDupes} intro candidate(s) seen yesterday`)
+
+  // If nothing new survives the dedup, skip the whole run (and the LLM call).
+  // Brian (May 13 PM): skip only when there's literally no fresh info.
+  if (allCandidates.length === 0 && allIntros.length === 0) {
+    log('Skipping — no new candidates after dedup against yesterday')
+    await updateTimestamps()
+    return NextResponse.json({
+      status: 'skipped',
+      reason: 'no-new-info',
+      dropped_dupes: droppedConvDupes + droppedIntroDupes,
+    })
+  }
 
   // 6. Generate the recap in one pass
   const post = await generateRecap({
@@ -366,7 +406,19 @@ export async function GET(req: NextRequest) {
   // 9. Update KV state — only on a real (non-overridden) post
   if (!channelOverride) {
     try {
-      await Promise.all([clearPendingIntros(), updateTimestamps()])
+      // Persist today's permalinks + URLs so tomorrow's run can dedupe against
+      // them. Both lists feed the set: permalinks identify threads, URLs
+      // identify shared links posted from different messages.
+      const todaysKeys = [
+        ...allCandidates.map((c) => c.permalink),
+        ...allCandidates.map((c) => c.url ?? '').filter(Boolean),
+        ...allIntros.map((i) => i.permalink).filter(Boolean),
+      ]
+      await Promise.all([
+        clearPendingIntros(),
+        updateTimestamps(),
+        setLastPostedKeys(todaysKeys),
+      ])
     } catch (err) {
       log(`KV update failed after post (non-fatal): ${err}`)
     }

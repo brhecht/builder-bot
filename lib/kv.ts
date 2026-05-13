@@ -29,3 +29,16 @@ export async function setPendingIntros(intros: PendingIntro[]): Promise<void> {
 export async function clearPendingIntros(): Promise<void> {
   await redis.del('pending_intros')
 }
+
+// Keys (permalinks + URLs) that appeared in the previous run's candidate set.
+// Used to dedupe today's recap against yesterday's so the same thread/URL
+// doesn't get re-surfaced. Stored as a flat string[] — small enough to keep in
+// a single KV blob, no TTL needed (overwritten every successful post).
+export async function getLastPostedKeys(): Promise<string[]> {
+  const val = await redis.get<string[]>('last_posted_keys')
+  return val ?? []
+}
+
+export async function setLastPostedKeys(keys: string[]): Promise<void> {
+  await redis.set('last_posted_keys', keys)
+}

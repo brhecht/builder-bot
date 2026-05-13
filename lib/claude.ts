@@ -43,9 +43,10 @@ If there are zero qualifying conversations AND zero qualifying intros,
 return: {"conversations": [], "intros": []}
 
 TOP CONVERSATIONS RULES
-- 2 minimum, 4 maximum. Quality bar before count. Pick threads that have
+- 1 minimum, 4 maximum. Quality bar before count. Pick threads that have
   3+ substantive replies/reactions OR are standalone build announcements
-  worth surfacing on their own.
+  worth surfacing on their own. If only one qualifying thread exists, post
+  that one — better a thin recap than a skipped day.
 - Rank by reply count + reactions.
 - Author = Slack display name verbatim from the input. Do not abbreviate.
 - summary = exactly two sentences with two PERIODS. Concrete nouns and verbs.
