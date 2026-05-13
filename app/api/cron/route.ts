@@ -58,8 +58,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
   }
 
-  // DST-aware time check: run only if it's 9:00–10:59 AM New York time
-  // Single cron at 14:30 UTC fires at 9:30 AM EST (winter) and 10:30 AM EDT (summer)
+  // Time check: run only if it's 8:00–8:59 AM Bogotá time (Colombia has no DST)
+  // Single cron at 13:00 UTC fires at 8:00 AM COT year-round, every day
   // ?test=true bypasses time/day gate (requires valid CRON_SECRET)
   // ?channel=<id> (test only) overrides post target — useful to DM yourself a preview
   // ?lookback_hours=<N> (test only) overrides KV timestamps with now-N*3600 — useful to backfill
@@ -68,14 +68,10 @@ export async function GET(req: NextRequest) {
   const channelOverride = isTest ? req.nextUrl.searchParams.get('channel') : null
   const lookbackHoursParam = isTest ? req.nextUrl.searchParams.get('lookback_hours') : null
   const lookbackHours = lookbackHoursParam ? parseFloat(lookbackHoursParam) : null
-  const now = DateTime.now().setZone('America/New_York')
+  const now = DateTime.now().setZone('America/Bogota')
   if (!isTest) {
-    if (now.weekday > 5) {
-      log('Skipping — weekend')
-      return NextResponse.json({ skipped: 'weekend' })
-    }
-    if (now.hour < 9 || now.hour >= 11) {
-      log(`Skipping — outside 9–11 AM NYC window (current: ${now.toFormat('HH:mm z')})`)
+    if (now.hour < 8 || now.hour >= 9) {
+      log(`Skipping — outside 8–9 AM Bogotá window (current: ${now.toFormat('HH:mm z')})`)
       return NextResponse.json({ skipped: 'outside-window' })
     }
   } else {
