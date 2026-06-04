@@ -130,6 +130,35 @@ export async function postMessage(channelId: string, text: string): Promise<void
   })
 }
 
+// Like postMessage, but returns the ts of the message that was created so the
+// caller can pin it (the weekly Builder of the Week flow pins its own post).
+export async function postAndGetTs(channelId: string, text: string): Promise<string> {
+  const data = await slackPost('chat.postMessage', {
+    channel: channelId,
+    text,
+    username: 'Builder Bot',
+    icon_emoji: ':hammer_and_wrench:',
+    unfurl_links: false,
+    unfurl_media: false,
+  })
+  return data.ts as string
+}
+
+export async function pinMessage(channelId: string, ts: string): Promise<void> {
+  await slackPost('pins.add', { channel: channelId, timestamp: ts })
+}
+
+// Unpin a previously-pinned message. Already-unpinned / no-pin errors are
+// non-fatal — we don't want a stale pin reference to block the new pin.
+export async function unpinMessage(channelId: string, ts: string): Promise<void> {
+  try {
+    await slackPost('pins.remove', { channel: channelId, timestamp: ts })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.log(`[builder-bot] unpin non-fatal: ${msg}`)
+  }
+}
+
 export function makeDeepLink(channelId: string, ts: string): string {
   // Slack deep link: remove the dot from the timestamp
   const tsClean = ts.replace('.', '')

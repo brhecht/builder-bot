@@ -502,3 +502,94 @@ export async function generateRecap(input: GenerateInput): Promise<string | null
 
   return assemblePost(data, input.dateStr, channelMap)
 }
+
+// --- Weekly "Builder of the Week" announcement copy ---
+
+const BOW_SYSTEM_PROMPT = `ROLE
+You write the weekly "Builder of the Week" announcement for the TNB (The New
+Builder) Slack community, in the voice of Brian Hecht (the founder).
+
+VOICE
+- Warm, human, dry humor. Brian opens with "Hi friends:" and often closes with
+  "Stay Humble!". Parentheticals and the occasional pop reference are on-brand.
+- No corporate jargon. No hype words ("amazing", "incredible", "rockstar").
+  Specific and genuine beats effusive.
+- Celebrate the person and what they actually shared — not vague praise.
+
+INPUT
+You get the winner's display name, the text of their standout post, the engagement
+numbers (reactions + replies that week), and the week label.
+
+OUTPUT — return ONLY the Slack message text (Slack mrkdwn), no preamble, no code
+fence, no JSON. Constraints:
+- Start with a bold trophy header line: "*🏆 Builder of the Week*".
+- Name the winner. Refer to their standout post in one specific sentence drawing
+  on its actual content (paraphrase — do not quote it back verbatim or include
+  the raw post).
+- One short line on why it resonated (the engagement it drew), stated naturally
+  ("…and the room showed up for it" rather than reciting raw counts robotically;
+  you MAY mention the numbers once).
+- 4–7 short lines total. Glanceable in under 20 seconds. No markdown headings
+  beyond the bold lines. Do NOT invent facts not present in the input.
+- Slack mrkdwn only: *bold* with single asterisks, _italics_ with underscores.
+  Do NOT use a real Slack @-mention (you don't have the user ID) — use the plain
+  display name. Do NOT fabricate a permalink — the assembler appends the real one.`
+
+export interface BuilderOfWeekInput {
+  name: string
+  topPostText: string
+  topPostLink: string
+  totalReactions: number
+  totalReplies: number
+  weekLabel: string // human-friendly, e.g. "week of Jun 2"
+}
+
+// Deterministic fallback used if the LLM call fails — still on-brand and useful.
+function fallbackBowMessage(input: BuilderOfWeekInput): string {
+  const postLine = input.topPostLink
+    ? `Their standout: <${input.topPostLink}|this post>.`
+    : 'Thanks for showing up and building in the open.'
+  return [
+    '*🏆 Builder of the Week*',
+    '',
+    `Hi friends: this week's Builder of the Week is *${input.name}*.`,
+    postLine,
+    `It drew the most engagement in the community — ${input.totalReactions} reactions and ${input.totalReplies} replies.`,
+    '',
+    'Keep building. Stay Humble!',
+  ].join('\n')
+}
+
+export async function generateBuilderOfWeek(input: BuilderOfWeekInput): Promise<string> {
+  const userPrompt = `Write this week's Builder of the Week announcement.
+
+Winner display name: ${input.name}
+Week: ${input.weekLabel}
+Engagement this week: ${input.totalReactions} reactions, ${input.totalReplies} replies (highest in the community)
+Their standout post text:
+"""
+${input.topPostText.slice(0, 1200)}
+"""
+
+Return ONLY the Slack message text per your instructions.`
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 512,
+      system: BOW_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userPrompt }],
+    })
+    const text = response.content[0]?.type === 'text' ? response.content[0].text.trim() : ''
+    if (!text) return fallbackBowMessage(input)
+
+    // The LLM is told not to fabricate a permalink. Append the real standout
+    // link as a clean footer if it isn't already referenced inline.
+    if (input.topPostLink && !text.includes(input.topPostLink)) {
+      return `${text}\n\n<${input.topPostLink}|See the post →>`
+    }
+    return text
+  } catch {
+    return fallbackBowMessage(input)
+  }
+}

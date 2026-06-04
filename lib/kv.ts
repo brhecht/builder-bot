@@ -1,5 +1,5 @@
 import { Redis } from '@upstash/redis'
-import { PendingIntro } from './types'
+import { PendingIntro, RecentWinner, BowPin } from './types'
 
 // Vercel Upstash integration injects KV_REST_API_URL / KV_REST_API_TOKEN
 const redis = new Redis({
@@ -41,4 +41,36 @@ export async function getLastPostedKeys(): Promise<string[]> {
 
 export async function setLastPostedKeys(keys: string[]): Promise<void> {
   await redis.set('last_posted_keys', keys)
+}
+
+// --- Weekly "Builder of the Week" state ---
+
+// ISO week (e.g. "2026-W23") of the most recent announcement. Used for
+// idempotency — the dual-fire Friday cron only announces once per week.
+export async function getBowLastWeek(): Promise<string | null> {
+  return (await redis.get<string>('bow_last_week')) ?? null
+}
+
+export async function setBowLastWeek(week: string): Promise<void> {
+  await redis.set('bow_last_week', week)
+}
+
+// Channel + ts of the currently-pinned announcement, so next week's run can
+// unpin it before pinning the new winner. null = nothing pinned yet.
+export async function getBowLastPin(): Promise<BowPin | null> {
+  return (await redis.get<BowPin>('bow_last_pin')) ?? null
+}
+
+export async function setBowLastPin(pin: BowPin): Promise<void> {
+  await redis.set('bow_last_pin', pin)
+}
+
+// Recent winners, used to enforce the no-repeat cooldown. Kept as a small
+// array; the route trims it to the cooldown window before writing back.
+export async function getRecentWinners(): Promise<RecentWinner[]> {
+  return (await redis.get<RecentWinner[]>('bow_recent_winners')) ?? []
+}
+
+export async function setRecentWinners(winners: RecentWinner[]): Promise<void> {
+  await redis.set('bow_recent_winners', winners)
 }

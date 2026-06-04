@@ -132,3 +132,60 @@ All require `Authorization: Bearer <CRON_SECRET>` and only work when `test=true`
 3. Once approved, do you want the cron live on the next weekday or do you want to schedule a specific start day?
 
 — Nico
+
+---
+
+## Weekly "Builder of the Week" (added Jun 2026)
+
+A second, weekly job (`/api/weekly`) that recognizes the most engaged community member each week. Separate from the daily recap — additive, the daily flow is untouched.
+
+**What it does:** Every **Friday 3 PM ET** it tallies engagement (reactions + thread replies) across `#share-and-discuss`, `#what-im-building`, and `#general` over the trailing 7 days, picks the **Builder of the Week** (top author by aggregate engagement, Brian + the bot excluded, 4-week no-repeat cooldown), writes a celebratory announcement in Brian's voice (Claude, with a deterministic fallback), posts it, and pins it in `#general`.
+
+**Engagement is free of extra API calls** — `reply_count` and the `reactions[]` array both come back in `conversations.history`, so no per-thread fetches.
+
+### 🧪 Trial mode (first 2 weeks)
+With `SLACK_BOW_TARGETS` set, the Friday announcement goes to **Nico's + Brian's DMs** instead of `#general`, and the **auto-pin is skipped**. The cron still fires automatically every Friday — only the destination changes. After review, **clear `SLACK_BOW_TARGETS` in Vercel** to go live to `#general` + pinning. No code change needed.
+
+### ⚠️ Required Slack scopes (Brian — you own the app)
+Add these to the Builder Bot Slack app, then **reinstall** to the workspace:
+- `reactions:read` — read reaction counts (without it, tallies are reaction-blind).
+- `pins:write` — `pins.add` / `pins.remove` (only used once live to `#general`).
+
+Existing scopes (`channels:history`, `channels:read`, `users:read`, `chat:write`, `chat:write.customize`, `channels:join`) stay.
+
+### Env vars
+| Var | Value | Notes |
+|-----|-------|-------|
+| `SLACK_BOW_TARGETS` | `U0AQEF27PMJ,U0AQPP9T4QZ` | Trial DMs (Nico, Brian). **Clear to go live.** |
+| `SLACK_BOW_EXCLUDE_IDS` | `U0AQPP9T4QZ`(+ bot user ID) | Who can't win. Add the bot's own user ID. |
+
+Reuses `SLACK_CHANNEL_SHARE_AND_DISCUSS`, `SLACK_CHANNEL_WHAT_IM_BUILDING`, `SLACK_CHANNEL_GENERAL`, `CRON_SECRET`, and the Upstash KV vars.
+
+### Cron
+`vercel.json` adds `{ "path": "/api/weekly", "schedule": "0 19,20 * * 5" }`. Friday 19:00 **and** 20:00 UTC cover 3 PM EDT and 3 PM EST; the internal `hour === 15` ET gate passes once, and the `bow_last_week` KV key makes the other firing a no-op. (Builder Bot now has 2 crons — confirm the Vercel plan allows it.)
+
+### Test commands (after scopes are added)
+All require `Authorization: Bearer <CRON_SECRET>` and `test=true`:
+| Params | Effect |
+|--------|--------|
+| `?test=true&dry_run=true&lookback_days=7` | Compute the ranking + winner, **no post/pin**. Returns JSON. |
+| `?test=true&channel=<DM_id>&lookback_days=7` | Post the real announcement to one DM. **Skips pin + KV.** |
+
+```bash
+npx vercel curl "/api/weekly?test=true&dry_run=true&lookback_days=7" \
+  --deployment "https://builder-bot.vercel.app" \
+  -- -H "Authorization: Bearer <CRON_SECRET>"
+```
+
+### KV keys (Upstash)
+`bow_last_week` (idempotency), `bow_last_pin` `{channel,ts}` (unpin prior week), `bow_recent_winners` `{userId,name,week}[]` (cooldown).
+
+### Files
+| File | Change |
+|------|--------|
+| `app/api/weekly/route.ts` | **NEW** — gate, tally, pick, copy, post, pin, KV |
+| `lib/slack.ts` | `postAndGetTs`, `pinMessage`, `unpinMessage` |
+| `lib/claude.ts` | `generateBuilderOfWeek` (+ deterministic fallback) |
+| `lib/kv.ts` | `bow_*` wrappers |
+| `lib/types.ts` | `reactions` on `SlackMessage`; `BuilderScore`, `RecentWinner`, `BowPin` |
+| `vercel.json` | +weekly cron |
