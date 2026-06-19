@@ -160,7 +160,20 @@ export async function unpinMessage(channelId: string, ts: string): Promise<void>
 }
 
 export function makeDeepLink(channelId: string, ts: string): string {
-  // Slack deep link: remove the dot from the timestamp
   const tsClean = ts.replace('.', '')
   return `https://slack.com/archives/${channelId}/p${tsClean}`
+}
+
+// Returns the user IDs of everyone who replied in a thread, excluding the
+// parent message author. Used by the weekly leaderboard to credit reply-writers.
+export async function getReplyAuthors(channelId: string, parentTs: string): Promise<string[]> {
+  try {
+    const data = await slackGet('conversations.replies', { channel: channelId, ts: parentTs, limit: '50' })
+    const messages = (data.messages ?? []) as Array<{ ts: string; user?: string }>
+    return messages
+      .filter((m) => m.ts !== parentTs && m.user)
+      .map((m) => m.user as string)
+  } catch {
+    return []
+  }
 }

@@ -81,16 +81,31 @@ export interface BuilderTopPost {
   score: number
 }
 
-// Per-author aggregate over the scoring window. score = totalReactions +
-// totalReplies (weights live as a constant in the weekly route).
+// Per-author aggregate over the scoring window.
+// score = posts*5 + reactionsReceived*2 + reactionsGiven*1 + repliesWritten*3
 export interface BuilderScore {
   userId: string
   userName: string
-  totalReactions: number
-  totalReplies: number
-  postCount: number
+  // Breakdown by participation type
+  posts: number              // original posts authored this week
+  reactionsReceived: number  // reactions received on own posts
+  reactionsGiven: number     // reactions given to others' posts
+  repliesWritten: number     // thread replies written in others' threads
+  // Legacy fields kept for BOW copy-generation (generateBuilderOfWeek input)
+  totalReactions: number     // = reactionsReceived
+  totalReplies: number       // reply_count received on own posts
+  postCount: number          // = posts
   score: number
-  topPost: BuilderTopPost
+  topPost: BuilderTopPost    // best-scoring post; only valid when posts > 0
+}
+
+// Cumulative all-time record per member, persisted in KV.
+export interface AllTimeEntry {
+  userId: string
+  name: string
+  totalPts: number
+  weeksParticipated: number
+  lastActive: string // ISO week, e.g. "2026-W23"
 }
 
 // A past winner, kept in KV to enforce the no-repeat cooldown.

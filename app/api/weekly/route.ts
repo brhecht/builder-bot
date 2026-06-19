@@ -7,6 +7,8 @@ import {
   setBowLastPin,
   getRecentWinners,
   setRecentWinners,
+  getAllTimeLeaderboard,
+  setAllTimeLeaderboard,
 } from '@/lib/kv'
 import {
   getChannelMessages,
@@ -15,13 +17,13 @@ import {
   pinMessage,
   unpinMessage,
   makeDeepLink,
+  getReplyAuthors,
 } from '@/lib/slack'
 import { generateBuilderOfWeek } from '@/lib/claude'
-import { BuilderScore, BuilderTopPost, RecentWinner } from '@/lib/types'
+import { BuilderScore, BuilderTopPost, RecentWinner, AllTimeEntry } from '@/lib/types'
 
 export const maxDuration = 60
 
-// Engagement-source channels for the weekly Builder of the Week tally.
 const CHANNELS = {
   SHARE_AND_DISCUSS: process.env.SLACK_CHANNEL_SHARE_AND_DISCUSS!,
   WHAT_IM_BUILDING: process.env.SLACK_CHANNEL_WHAT_IM_BUILDING!,
@@ -34,19 +36,23 @@ const CHANNEL_NAMES: Record<string, string> = {
   [process.env.SLACK_CHANNEL_GENERAL ?? '']: 'general',
 }
 
-// Engagement weights (tunable). score = reactions*REACTION_WEIGHT + replies*REPLY_WEIGHT
-const REACTION_WEIGHT = 1
-const REPLY_WEIGHT = 1
-// A winner can't win again for this many weeks — the spotlight rotates.
-const COOLDOWN_WEEKS = 4
+// Leaderboard point weights (tunable).
+// score = posts*POST + reactionsReceived*REACTION_RECEIVED + reactionsGiven*REACTION_GIVEN + repliesWritten*REPLY_WRITTEN
+const POINTS = {
+  POST: 5,
+  REACTION_RECEIVED: 2,
+  REACTION_GIVEN: 1,
+  REPLY_WRITTEN: 3,
+} as const
+
+const COOLDOWN_WEEKS = 4            // BOW winner no-repeat window
+const MAX_REPLY_THREADS = 30        // max threads to fetch reply-authors from (per channel)
+const TOP_N = 5                     // leaderboard positions shown in Friday post
 
 function log(msg: string) {
   console.log(`[builder-bot:weekly] ${msg}`)
 }
 
-// Trial mode: when SLACK_BOW_TARGETS is set (comma-separated user/channel IDs),
-// the announcement goes to those DMs and the auto-pin is skipped. When empty,
-// the bot posts to #general and pins. Mirrors the daily bot's getRecapTargets().
 function getBowTargets(): string[] {
   return (process.env.SLACK_BOW_TARGETS ?? '')
     .split(',')
@@ -63,8 +69,67 @@ function getExcludeIds(): Set<string> {
   )
 }
 
+// Deterministic leaderboard post — no Claude call needed.
+function formatLeaderboard(
+  weeklyRanked: BuilderScore[],
+  allTime: AllTimeEntry[],
+  weekLabel: string,
+): string {
+  const medals = ['🥇', '🥈', '🥉']
+  const topN = weeklyRanked.slice(0, TOP_N)
+
+  const lines: string[] = [`*📊 Community Leaderboard — ${weekLabel}*`, '']
+
+  for (let i = 0; i < topN.length; i++) {
+    const b = topN[i]
+    const prefix = i < 3 ? medals[i] : `${i + 1}.`
+    lines.push(`${prefix} *${b.userName}* — ${b.score} pts`)
+    if (i === 0) {
+      // Show breakdown only for the winner so the post stays glanceable.
+      lines.push(
+        `   _${b.posts} post${b.posts !== 1 ? 's' : ''} · ${b.reactionsReceived} rxn received · ${b.reactionsGiven} rxn given · ${b.repliesWritten} replies_`,
+      )
+    }
+  }
+
+  const topAllTime = [...allTime].sort((a, b) => b.totalPts - a.totalPts).slice(0, 3)
+  if (topAllTime.length > 0) {
+    lines.push('')
+    lines.push(`*All-time:* ${topAllTime.map((e) => `${e.name} (${e.totalPts})`).join(' · ')}`)
+  }
+
+  lines.push('')
+  lines.push(
+    `_Scoring: post +${POINTS.POST} · rxn received +${POINTS.REACTION_RECEIVED} · rxn given +${POINTS.REACTION_GIVEN} · reply +${POINTS.REPLY_WRITTEN}_`,
+  )
+
+  return lines.join('\n')
+}
+
+// Upsert a member's weekly points into the all-time map.
+function mergeAllTime(
+  allTimeMap: Map<string, AllTimeEntry>,
+  b: BuilderScore,
+  currentWeek: string,
+): void {
+  const existing = allTimeMap.get(b.userId)
+  if (!existing) {
+    allTimeMap.set(b.userId, {
+      userId: b.userId,
+      name: b.userName || b.userId,
+      totalPts: b.score,
+      weeksParticipated: 1,
+      lastActive: currentWeek,
+    })
+  } else {
+    existing.totalPts += b.score
+    existing.weeksParticipated += 1
+    existing.lastActive = currentWeek
+    if (b.userName) existing.name = b.userName // keep name fresh
+  }
+}
+
 export async function GET(req: NextRequest) {
-  // Verify Vercel cron secret (same pattern as /api/cron)
   const auth = req.headers.get('authorization')
   if (process.env.CRON_SECRET && auth !== `Bearer ${process.env.CRON_SECRET}`) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
@@ -76,9 +141,8 @@ export async function GET(req: NextRequest) {
   const lookbackDaysParam = isTest ? req.nextUrl.searchParams.get('lookback_days') : null
   const lookbackDays = lookbackDaysParam ? parseFloat(lookbackDaysParam) : 7
 
-  // Time gate: Friday 3 PM Eastern. luxon resolves DST automatically, so a
-  // single hour===15 check is correct year-round; the dual-UTC cron
-  // (0 19,20 * * 5) fires on both candidate hours and only one passes.
+  // Friday 3 PM Eastern gate. Dual-UTC cron (19:00 + 20:00) covers both EDT and EST;
+  // only one passes the hour===15 ET check. luxon resolves DST automatically.
   const now = DateTime.now().setZone('America/New_York')
   if (!isTest) {
     if (now.weekday !== 5) {
@@ -93,9 +157,9 @@ export async function GET(req: NextRequest) {
     log(`Test mode — bypassing time gate (${now.toFormat('cccc HH:mm z')})`)
   }
 
-  const currentWeek = now.toFormat("kkkk-'W'WW") // ISO week, e.g. "2026-W23"
+  const currentWeek = now.toFormat("kkkk-'W'WW")
 
-  // Idempotency: only one announcement per ISO week (covers the dual-fire cron).
+  // Idempotency: one announcement per ISO week.
   if (!isTest) {
     const lastWeek = await getBowLastWeek()
     if (lastWeek === currentWeek) {
@@ -109,23 +173,25 @@ export async function GET(req: NextRequest) {
   const weekLabel = `week of ${weekStart.toFormat('LLL d')}`
   log(`Starting run — ${currentWeek}, window since ${weekStart.toFormat('LLL d HH:mm z')}`)
 
-  // 1. Fetch the engagement-source channels concurrently. No thread fetches —
-  //    reply_count + reactions[] both come back in conversations.history.
+  // ── 1. Fetch messages from source channels concurrently ──────────────────────
   const sourceChannels = [CHANNELS.SHARE_AND_DISCUSS, CHANNELS.WHAT_IM_BUILDING, CHANNELS.GENERAL]
-  const results = await Promise.allSettled(
-    sourceChannels.map((ch) => getChannelMessages(ch, oldest))
+  const fetchResults = await Promise.allSettled(
+    sourceChannels.map((ch) => getChannelMessages(ch, oldest)),
   )
 
-  // 2. Aggregate engagement per author (no name resolution yet — we resolve
-  //    only the winner + dry-run top N to avoid a getUserName per author).
   const excludeIds = getExcludeIds()
   const agg = new Map<string, BuilderScore>()
   const channelDiag: Record<string, number | string> = {}
 
+  // Threads queued for reply-author fetching (capped per channel).
+  const replyThreads: Array<{ channelId: string; parentTs: string }> = []
+
+  // ── 2. First pass: posts, reactions received, reactions given ────────────────
   for (let i = 0; i < sourceChannels.length; i++) {
     const channelId = sourceChannels[i]
     const name = CHANNEL_NAMES[channelId] ?? channelId
-    const r = results[i]
+    const r = fetchResults[i]
+
     if (r.status === 'rejected') {
       channelDiag[name] = r.reason instanceof Error ? r.reason.message : String(r.reason)
       log(`Skipping ${name}: ${channelDiag[name]}`)
@@ -133,65 +199,137 @@ export async function GET(req: NextRequest) {
     }
     channelDiag[name] = r.value.length
 
+    let threadCount = 0
     for (const msg of r.value) {
       const userId = msg.user
-      if (!userId || excludeIds.has(userId)) continue
-      if (msg.subtype === 'bot_message') continue
+      if (!userId || msg.subtype === 'bot_message') continue
 
       const reactions = (msg.reactions ?? []).reduce((sum, rx) => sum + (rx.count ?? 0), 0)
-      const replies = msg.reply_count ?? 0
-      const postScore = reactions * REACTION_WEIGHT + replies * REPLY_WEIGHT
-      if (postScore === 0) continue // no engagement — can't be Builder of the Week
+      const replyCount = msg.reply_count ?? 0
 
-      const topPost: BuilderTopPost = {
-        ts: msg.ts,
-        permalink: makeDeepLink(channelId, msg.ts),
-        text: msg.text ?? '',
-        channelName: name,
-        reactions,
-        replies,
-        score: postScore,
+      // Credit the author for posting + reactions received.
+      if (!excludeIds.has(userId)) {
+        const postPts = POINTS.POST + reactions * POINTS.REACTION_RECEIVED
+
+        const topPost: BuilderTopPost = {
+          ts: msg.ts,
+          permalink: makeDeepLink(channelId, msg.ts),
+          text: msg.text ?? '',
+          channelName: name,
+          reactions,
+          replies: replyCount,
+          score: postPts,
+        }
+
+        const existing = agg.get(userId)
+        if (!existing) {
+          agg.set(userId, {
+            userId,
+            userName: '',
+            posts: 1,
+            reactionsReceived: reactions,
+            reactionsGiven: 0,
+            repliesWritten: 0,
+            totalReactions: reactions,
+            totalReplies: replyCount,
+            postCount: 1,
+            score: postPts,
+            topPost,
+          })
+        } else {
+          existing.posts += 1
+          existing.reactionsReceived += reactions
+          existing.totalReactions += reactions
+          existing.totalReplies += replyCount
+          existing.postCount += 1
+          existing.score += postPts
+          if (postPts > existing.topPost.score) existing.topPost = topPost
+        }
       }
 
-      const existing = agg.get(userId)
-      if (!existing) {
-        agg.set(userId, {
-          userId,
-          userName: '',
-          totalReactions: reactions,
-          totalReplies: replies,
-          postCount: 1,
-          score: postScore,
-          topPost,
-        })
-      } else {
-        existing.totalReactions += reactions
-        existing.totalReplies += replies
-        existing.postCount += 1
-        existing.score += postScore
-        if (postScore > existing.topPost.score) existing.topPost = topPost
+      // Credit each reactor (reactions[].users[] — requires reactions:read scope).
+      for (const rx of msg.reactions ?? []) {
+        for (const reactorId of rx.users ?? []) {
+          if (!reactorId || reactorId === userId || excludeIds.has(reactorId)) continue
+          const re = agg.get(reactorId)
+          if (!re) {
+            agg.set(reactorId, {
+              userId: reactorId,
+              userName: '',
+              posts: 0,
+              reactionsReceived: 0,
+              reactionsGiven: 1,
+              repliesWritten: 0,
+              totalReactions: 0,
+              totalReplies: 0,
+              postCount: 0,
+              score: POINTS.REACTION_GIVEN,
+              topPost: { ts: '', permalink: '', text: '', channelName: '', reactions: 0, replies: 0, score: 0 },
+            })
+          } else {
+            re.reactionsGiven += 1
+            re.score += POINTS.REACTION_GIVEN
+          }
+        }
+      }
+
+      // Queue threads for reply-author tracking (capped).
+      if (replyCount > 0 && threadCount < MAX_REPLY_THREADS) {
+        replyThreads.push({ channelId, parentTs: msg.ts })
+        threadCount++
       }
     }
   }
 
-  // 3. Cooldown: exclude anyone who won within the last COOLDOWN_WEEKS (one
-  //    winner per week, so the trimmed recent list IS the last N weeks).
+  // ── 3. Second pass: reply authors ────────────────────────────────────────────
+  if (replyThreads.length > 0) {
+    log(`Fetching reply authors for ${replyThreads.length} threads`)
+    const replyResults = await Promise.allSettled(
+      replyThreads.map(({ channelId, parentTs }) => getReplyAuthors(channelId, parentTs)),
+    )
+    for (const r of replyResults) {
+      if (r.status === 'rejected') continue
+      for (const replyUserId of r.value) {
+        if (excludeIds.has(replyUserId)) continue
+        const re = agg.get(replyUserId)
+        if (!re) {
+          agg.set(replyUserId, {
+            userId: replyUserId,
+            userName: '',
+            posts: 0,
+            reactionsReceived: 0,
+            reactionsGiven: 0,
+            repliesWritten: 1,
+            totalReactions: 0,
+            totalReplies: 0,
+            postCount: 0,
+            score: POINTS.REPLY_WRITTEN,
+            topPost: { ts: '', permalink: '', text: '', channelName: '', reactions: 0, replies: 0, score: 0 },
+          })
+        } else {
+          re.repliesWritten += 1
+          re.score += POINTS.REPLY_WRITTEN
+        }
+      }
+    }
+  }
+
+  // ── 4. Rank: score desc → reactions received desc → earliest top post ────────
+  const allScored = Array.from(agg.values()).filter((b) => b.score > 0)
+
+  const weeklyRanked = allScored.sort(
+    (a, b) =>
+      b.score - a.score ||
+      b.reactionsReceived - a.reactionsReceived ||
+      a.topPost.ts.localeCompare(b.topPost.ts),
+  )
+
+  // BOW eligibility: cooldown + must have at least 1 original post (needs a topPost for the narrative).
   const recentWinners = await getRecentWinners()
   const cooldownIds = new Set(recentWinners.map((w) => w.userId))
+  const bowEligible = weeklyRanked.filter((b) => !cooldownIds.has(b.userId) && b.posts > 0)
+  const winner = bowEligible[0]
 
-  // 4. Rank: score desc, then total reactions desc, then earliest standout post.
-  const ranked = Array.from(agg.values())
-    .filter((b) => !cooldownIds.has(b.userId))
-    .sort((a, b) =>
-      b.score - a.score ||
-      b.totalReactions - a.totalReactions ||
-      a.topPost.ts.localeCompare(b.topPost.ts)
-    )
-
-  const winner = ranked[0]
-
-  // No eligible builder this week → skip (but mark the week so the dual-cron
-  // doesn't recompute at the second firing).
   if (!winner) {
     log('Skipping — no eligible builder with engagement this week')
     if (!isTest && !channelOverride) await setBowLastWeek(currentWeek)
@@ -203,33 +341,48 @@ export async function GET(req: NextRequest) {
     })
   }
 
-  // 5. Resolve the winner's display name (1 API call).
-  winner.userName = await getUserName(winner.userId)
+  // ── 5. Resolve display names (top N + winner, batched) ──────────────────────
+  const usersToResolve = new Set([winner.userId, ...weeklyRanked.slice(0, TOP_N).map((b) => b.userId)])
+  await Promise.all(
+    Array.from(usersToResolve).map(async (uid) => {
+      const name = await getUserName(uid)
+      const entry = agg.get(uid)
+      if (entry) entry.userName = name
+    }),
+  )
 
-  // 6. Dry run — return the computed ranking, no post/pin.
+  // ── 6. Dry run ───────────────────────────────────────────────────────────────
   if (isDryRun) {
-    const topN = await Promise.all(
-      ranked.slice(0, 10).map(async (b) => ({
-        name: b.userId === winner.userId ? winner.userName : await getUserName(b.userId),
-        score: b.score,
-        reactions: b.totalReactions,
-        replies: b.totalReplies,
-        posts: b.postCount,
-        top_post: b.topPost.permalink,
-      }))
-    )
     return NextResponse.json({
       status: 'dry_run',
       week: currentWeek,
       window_days: lookbackDays,
       winner: { name: winner.userName, score: winner.score },
-      ranked: topN,
-      _diag: { channels: channelDiag, cooldown: Array.from(cooldownIds) },
+      weekly_leaderboard: weeklyRanked.slice(0, TOP_N).map((b, i) => ({
+        rank: i + 1,
+        name: b.userName || b.userId,
+        score: b.score,
+        posts: b.posts,
+        reactionsReceived: b.reactionsReceived,
+        reactionsGiven: b.reactionsGiven,
+        repliesWritten: b.repliesWritten,
+      })),
+      _diag: {
+        channels: channelDiag,
+        cooldown: Array.from(cooldownIds),
+        reply_threads_fetched: replyThreads.length,
+      },
     })
   }
 
-  // 7. Generate the announcement copy (Claude, Brian's TNB voice + fallback).
-  const message = await generateBuilderOfWeek({
+  // ── 7. Update all-time leaderboard ───────────────────────────────────────────
+  const allTime = await getAllTimeLeaderboard()
+  const allTimeMap = new Map<string, AllTimeEntry>(allTime.map((e) => [e.userId, e]))
+  for (const b of allScored) mergeAllTime(allTimeMap, b, currentWeek)
+  const updatedAllTime = Array.from(allTimeMap.values())
+
+  // ── 8. Generate BOW announcement (Claude, Brian's voice) ─────────────────────
+  const bowMessage = await generateBuilderOfWeek({
     name: winner.userName,
     topPostText: winner.topPost.text,
     topPostLink: winner.topPost.permalink,
@@ -238,23 +391,45 @@ export async function GET(req: NextRequest) {
     weekLabel,
   })
 
-  // 8. Resolve targets. Trial → DMs (no pin). Production → #general (+ pin).
-  const bowTargets = getBowTargets()
-  const targets = channelOverride ? [channelOverride] : bowTargets.length > 0 ? bowTargets : [CHANNELS.GENERAL]
-  const isProduction = !channelOverride && bowTargets.length === 0
-  log(`Posting to ${targets.length} target(s): ${targets.join(', ')} (${isProduction ? 'production/#general' : 'trial/DM'})`)
+  // ── 9. Format leaderboard post (deterministic) ───────────────────────────────
+  const leaderboardMessage = formatLeaderboard(weeklyRanked, updatedAllTime, weekLabel)
 
-  const postResults = await Promise.allSettled(targets.map((t) => postAndGetTs(t, message)))
-  const failed = postResults
-    .map((r, i) => (r.status === 'rejected' ? { target: targets[i], error: r.reason instanceof Error ? r.reason.message : String(r.reason) } : null))
-    .filter((x): x is { target: string; error: string } => x !== null)
+  // ── 10. Resolve posting targets ──────────────────────────────────────────────
+  const bowTargets = getBowTargets()
+  const targets = channelOverride
+    ? [channelOverride]
+    : bowTargets.length > 0
+    ? bowTargets
+    : [CHANNELS.GENERAL]
+  const isProduction = !channelOverride && bowTargets.length === 0
+  log(`Posting to ${targets.join(', ')} (${isProduction ? 'production' : 'trial'})`)
+
+  // ── 11. Post BOW announcement (post 1) ───────────────────────────────────────
+  const bowPostResults = await Promise.allSettled(targets.map((t) => postAndGetTs(t, bowMessage)))
+
+  // ── 12. Post leaderboard (post 2, same targets) ──────────────────────────────
+  const lbPostResults = await Promise.allSettled(targets.map((t) => postAndGetTs(t, leaderboardMessage)))
+
+  const failed = [
+    ...bowPostResults.map((r, i) =>
+      r.status === 'rejected'
+        ? { target: targets[i], post: 'bow', error: r.reason instanceof Error ? r.reason.message : String(r.reason) }
+        : null,
+    ),
+    ...lbPostResults.map((r, i) =>
+      r.status === 'rejected'
+        ? { target: targets[i], post: 'leaderboard', error: r.reason instanceof Error ? r.reason.message : String(r.reason) }
+        : null,
+    ),
+  ].filter((x): x is { target: string; post: string; error: string } => x !== null)
+
   if (failed.length > 0) log(`Post failures: ${JSON.stringify(failed)}`)
 
-  // 9. Pin in #general (production only). Unpin last week's announcement first.
+  // ── 13. Pin BOW announcement in #general (production only) ───────────────────
   let pinned = false
   if (isProduction) {
     const generalIdx = targets.indexOf(CHANNELS.GENERAL)
-    const postRes = postResults[generalIdx]
+    const postRes = bowPostResults[generalIdx]
     if (postRes?.status === 'fulfilled') {
       const newTs = postRes.value
       try {
@@ -269,12 +444,16 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // 10. KV update on real scheduled runs (skip only on manual ?channel override).
+  // ── 14. Persist KV state (skip on manual channel override) ──────────────────
   if (!channelOverride) {
     try {
       const newWinner: RecentWinner = { userId: winner.userId, name: winner.userName, week: currentWeek }
       const trimmed = [...recentWinners.filter((w) => w.week !== currentWeek), newWinner].slice(-COOLDOWN_WEEKS)
-      await Promise.all([setBowLastWeek(currentWeek), setRecentWinners(trimmed)])
+      await Promise.all([
+        setBowLastWeek(currentWeek),
+        setRecentWinners(trimmed),
+        setAllTimeLeaderboard(updatedAllTime),
+      ])
     } catch (err) {
       log(`KV update failed after post (non-fatal): ${err}`)
     }
@@ -287,12 +466,15 @@ export async function GET(req: NextRequest) {
     week: currentWeek,
     winner: winner.userName,
     score: winner.score,
-    reactions: winner.totalReactions,
-    replies: winner.totalReplies,
     targets,
     pinned,
     mode: isProduction ? 'production' : 'trial',
     failed,
     test_override: !!channelOverride,
+    leaderboard_top5: weeklyRanked.slice(0, TOP_N).map((b, i) => ({
+      rank: i + 1,
+      name: b.userName || b.userId,
+      score: b.score,
+    })),
   })
 }

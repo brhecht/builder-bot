@@ -1,5 +1,5 @@
 import { Redis } from '@upstash/redis'
-import { PendingIntro, RecentWinner, BowPin } from './types'
+import { PendingIntro, RecentWinner, BowPin, AllTimeEntry } from './types'
 
 // Vercel Upstash integration injects KV_REST_API_URL / KV_REST_API_TOKEN
 const redis = new Redis({
@@ -73,4 +73,13 @@ export async function getRecentWinners(): Promise<RecentWinner[]> {
 
 export async function setRecentWinners(winners: RecentWinner[]): Promise<void> {
   await redis.set('bow_recent_winners', winners)
+}
+
+// All-time cumulative leaderboard, updated every Friday after the announcement.
+export async function getAllTimeLeaderboard(): Promise<AllTimeEntry[]> {
+  return (await redis.get<AllTimeEntry[]>('leaderboard_alltime')) ?? []
+}
+
+export async function setAllTimeLeaderboard(entries: AllTimeEntry[]): Promise<void> {
+  await redis.set('leaderboard_alltime', entries)
 }
