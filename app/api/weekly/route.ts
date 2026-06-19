@@ -83,9 +83,8 @@ function formatLeaderboard(
   for (let i = 0; i < topN.length; i++) {
     const b = topN[i]
     const prefix = i < 3 ? medals[i] : `${i + 1}.`
-    lines.push(`${prefix} *${b.userName}* — ${b.score} pts`)
+    lines.push(`${prefix} *${b.userName}* — ${b.score} Tendys 🐓`)
     if (i === 0) {
-      // Show breakdown only for the winner so the post stays glanceable.
       lines.push(
         `   _${b.posts} post${b.posts !== 1 ? 's' : ''} · ${b.reactionsReceived} rxn received · ${b.reactionsGiven} rxn given · ${b.repliesWritten} replies_`,
       )
@@ -95,12 +94,12 @@ function formatLeaderboard(
   const topAllTime = [...allTime].sort((a, b) => b.totalPts - a.totalPts).slice(0, 3)
   if (topAllTime.length > 0) {
     lines.push('')
-    lines.push(`*All-time:* ${topAllTime.map((e) => `${e.name} (${e.totalPts})`).join(' · ')}`)
+    lines.push(`*All-time:* ${topAllTime.map((e) => `${e.name} (${e.totalPts} 🐓)`).join(' · ')}`)
   }
 
   lines.push('')
   lines.push(
-    `_Scoring: post +${POINTS.POST} · rxn received +${POINTS.REACTION_RECEIVED} · rxn given +${POINTS.REACTION_GIVEN} · reply +${POINTS.REPLY_WRITTEN}_`,
+    `_Scoring: post +${POINTS.POST} · rxn received +${POINTS.REACTION_RECEIVED} · rxn given +${POINTS.REACTION_GIVEN} · reply +${POINTS.REPLY_WRITTEN} Tendys 🐓_`,
   )
 
   return lines.join('\n')
