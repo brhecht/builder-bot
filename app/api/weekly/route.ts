@@ -129,12 +129,16 @@ function mergeAllTime(
 }
 
 export async function GET(req: NextRequest) {
+  const isTest = req.nextUrl.searchParams.get('test') === 'true'
+
   const auth = req.headers.get('authorization')
-  if (process.env.CRON_SECRET && auth !== `Bearer ${process.env.CRON_SECRET}`) {
+  const querySecret = isTest ? req.nextUrl.searchParams.get('secret') : null
+  const validAuth =
+    auth === `Bearer ${process.env.CRON_SECRET}` ||
+    (isTest && querySecret === process.env.CRON_SECRET)
+  if (process.env.CRON_SECRET && !validAuth) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
   }
-
-  const isTest = req.nextUrl.searchParams.get('test') === 'true'
   const isDryRun = req.nextUrl.searchParams.get('dry_run') === 'true'
   const channelOverride = isTest ? req.nextUrl.searchParams.get('channel') : null
   const lookbackDaysParam = isTest ? req.nextUrl.searchParams.get('lookback_days') : null
