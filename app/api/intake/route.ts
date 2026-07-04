@@ -17,8 +17,8 @@ import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { waitUntil } from '@vercel/functions'
 import {
-  SUBMITTER_ID, APPROVER_ID, claimEvent, getMsgRef, reactionKind,
-  handleNewPaste, handleOk, handleEdit, handleSkip, handleStatus, handleHelp, finalizeApproval,
+  SUBMITTER_ID, APPROVER_ID, claimEvent, getMsgRef, reactionKind, logDebug,
+  handleNewPaste, handleOk, handleEdit, handleSkip, handleStatus, handleHelp, handleUnbound, finalizeApproval,
 } from '@/lib/intake'
 
 export const dynamic = 'force-dynamic'
@@ -64,8 +64,10 @@ export async function POST(req: NextRequest) {
     url.searchParams.get('secret') === process.env.CRON_SECRET
 
   if (!isTest) {
-    const secret = process.env.SLACK_SIGNING_SECRET
-    if (!secret) return NextResponse.json({ error: 'SLACK_SIGNING_SECRET not configured' }, { status: 503 })
+    // The intake flow lives in the HC workspace via its own Slack app — its
+    // signing secret is INTAKE_SLACK_SIGNING_SECRET (shared var as fallback).
+    const secret = process.env.INTAKE_SLACK_SIGNING_SECRET || process.env.SLACK_SIGNING_SECRET
+    if (!secret) return NextResponse.json({ error: 'INTAKE_SLACK_SIGNING_SECRET not configured' }, { status: 503 })
     const ok = verifySignature(raw, req.headers.get('x-slack-request-timestamp'), req.headers.get('x-slack-signature'), secret)
     if (!ok) return NextResponse.json({ error: 'bad signature' }, { status: 401 })
   }
@@ -83,17 +85,18 @@ export async function POST(req: NextRequest) {
   const ev = payload.event
 
   // --- Nico DMs the bot -------------------------------------------------------
-  if (ev.type === 'message' && ev.channel_type === 'im' && !ev.bot_id && !ev.subtype && ev.channel && ev.user === SUBMITTER_ID) {
+  if (ev.type === 'message' && ev.channel_type === 'im' && !ev.bot_id && !ev.subtype && ev.channel && ev.user) {
     const text = (ev.text || '').trim()
     const channel = ev.channel
     let job: Promise<void>
-    if (/^(ok|ok manda|manda|go|send)$/i.test(text)) job = handleOk(channel)
+    if (!SUBMITTER_ID || ev.user !== SUBMITTER_ID) job = handleUnbound(channel, ev.user) // self-serve ID binding
+    else if (/^(ok|ok manda|manda|go|send)$/i.test(text)) job = handleOk(channel)
     else if (/^edit\s+/i.test(text)) job = handleEdit(channel, text.replace(/^edit\s+/i, ''))
     else if (/^(skip|cancel|descarta|descartar)$/i.test(text)) job = handleSkip(channel)
     else if (/^(status|estado|pendiente)$/i.test(text)) job = handleStatus(channel)
     else if (/^(help|ayuda|\?)$/i.test(text)) job = handleHelp(channel)
     else job = handleNewPaste(channel, text)
-    waitUntil(job.catch((err) => console.error('intake job failed:', err)))
+    waitUntil(job.catch((err) => logDebug('message-job', err)))
     return NextResponse.json({ ok: true })
   }
 
@@ -106,7 +109,7 @@ export async function POST(req: NextRequest) {
         (async () => {
           const proposalId = await getMsgRef(channel, ts)
           if (proposalId) await finalizeApproval(proposalId, kind === 'approve')
-        })().catch((err) => console.error('intake approval failed:', err))
+        })().catch((err) => logDebug('approval-job', err))
       )
     }
     return NextResponse.json({ ok: true })
@@ -120,7 +123,13 @@ export async function GET() {
   return NextResponse.json({
     ok: true,
     feature: 'brain-intake',
+    workspace: process.env.INTAKE_SLACK_BOT_TOKEN ? 'hc (own app)' : 'fallback (shared TNB token)',
     trial: APPROVER_ID === SUBMITTER_ID,
-    configured: { signingSecret: !!process.env.SLACK_SIGNING_SECRET, brainKey: !!process.env.BRAIN_INBOX_API_KEY },
+    configured: {
+      submitter: !!SUBMITTER_ID,
+      signingSecret: !!(process.env.INTAKE_SLACK_SIGNING_SECRET || process.env.SLACK_SIGNING_SECRET),
+      anthropicKey: !!process.env.ANTHROPIC_API_KEY,
+      brainKey: !!process.env.BRAIN_INBOX_API_KEY,
+    },
   })
 }

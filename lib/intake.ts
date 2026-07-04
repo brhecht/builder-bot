@@ -1,25 +1,31 @@
 // Brain Intake — Slack DM → Claude breakdown → approval → Brain Inbox.
 //
 // Flow: Nico pastes raw material (a Brian burst, meeting fragment, voice-note
-// transcript, idea dump) into his DM with the bot. Claude decomposes it into
-// structured work items (translate-brian distilled). The bot posts the
+// transcript, idea dump) into his DM with the intake bot. Claude decomposes it
+// into structured work items (translate-brian distilled). The bot posts the
 // breakdown back for Nico's review; on "ok" it sends a compressed English
 // proposal to the approver (Brian — or Nico himself while INTAKE_APPROVER_ID
 // is unset = TRIAL MODE). A ✅ reaction from the approver logs every item into
 // Nico's Brain Inbox via its REST API. Nothing is ever logged without the
 // approval reaction.
 //
-// Self-contained on purpose: own Redis + Anthropic clients (same pattern the
-// rest of the repo uses), so the daily/weekly cron paths are untouched.
+// WORKSPACE NOTE: this flow lives in the HUMBLE CONVICTION Slack workspace via
+// its own Slack app ("Brain Intake", see INTAKE-SETUP.md), NOT in the TNB
+// workspace where the recap crons run. That's why it uses its own credentials:
+// INTAKE_SLACK_BOT_TOKEN / INTAKE_SLACK_SIGNING_SECRET (falling back to the
+// shared SLACK_* vars only so the flow can be exercised before the HC app
+// exists). Self-contained on purpose — the daily/weekly cron paths and
+// lib/slack.ts are untouched.
 
 import Anthropic from '@anthropic-ai/sdk'
 import { Redis } from '@upstash/redis'
-import { postMessage, postAndGetMsg, updateMessage } from './slack'
 
 // --- Config -----------------------------------------------------------------
 
-export const SUBMITTER_ID = process.env.INTAKE_SUBMITTER_ID || 'U0AQEF27PMJ' // Nico
-// Unset ⇒ approvals go to the submitter = TRIAL MODE. Live: set to Brian's ID.
+// Set in Vercel. Empty ⇒ unbound: the bot replies to any DM with the sender's
+// user ID + setup instructions (self-serve binding, no ID hunting).
+export const SUBMITTER_ID = process.env.INTAKE_SUBMITTER_ID || ''
+// Unset ⇒ approvals go to the submitter = TRIAL MODE. Live: set to Brian's HC id.
 export const APPROVER_ID = process.env.INTAKE_APPROVER_ID || SUBMITTER_ID
 const IS_TRIAL = APPROVER_ID === SUBMITTER_ID
 
@@ -65,6 +71,40 @@ export interface IntakeProposal {
   loggedShortIds?: string[]
 }
 
+// --- Intake-scoped Slack client ----------------------------------------------
+// Uses the HC workspace app's token when configured; falls back to the shared
+// TNB bot token so the pipeline can be tested before the HC app exists.
+
+function intakeToken(): string {
+  return process.env.INTAKE_SLACK_BOT_TOKEN || process.env.SLACK_BOT_TOKEN || ''
+}
+
+async function slackApi(method: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch(`https://slack.com/api/${method}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${intakeToken()}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const data = (await res.json()) as Record<string, unknown>
+  if (!data.ok) throw new Error(`Slack ${method} failed: ${data.error}`)
+  return data
+}
+
+async function say(channel: string, text: string): Promise<void> {
+  await slackApi('chat.postMessage', { channel, text, unfurl_links: false, unfurl_media: false })
+}
+
+async function sayAndGetMsg(channelOrUserId: string, text: string): Promise<{ channel: string; ts: string }> {
+  // Posting to a USER id resolves to a D… channel; the later reaction_added
+  // event carries that D… id, so we must store what Slack resolved.
+  const data = await slackApi('chat.postMessage', { channel: channelOrUserId, text, unfurl_links: false, unfurl_media: false })
+  return { channel: data.channel as string, ts: data.ts as string }
+}
+
+async function editMsg(channel: string, ts: string, text: string): Promise<void> {
+  await slackApi('chat.update', { channel, ts, text })
+}
+
 // --- KV state ---------------------------------------------------------------
 
 const redis = new Redis({
@@ -73,6 +113,15 @@ const redis = new Redis({
 })
 
 const TTL = 60 * 60 * 24 * 14 // 14 days
+
+// Last runtime error, readable without log access: redis GET intake_debug_last
+export async function logDebug(where: string, err: unknown): Promise<void> {
+  const msg = err instanceof Error ? `${err.message}\n${err.stack?.split('\n').slice(0, 3).join('\n')}` : String(err)
+  console.error(`intake ${where} failed:`, err)
+  try {
+    await redis.set('intake_debug_last', { where, msg, at: new Date().toISOString() }, { ex: 3600 })
+  } catch { /* debug must never take the flow down */ }
+}
 
 async function getProposal(id: string): Promise<IntakeProposal | null> {
   return (await redis.get<IntakeProposal>(`intake_prop_${id}`)) ?? null
@@ -101,8 +150,6 @@ export async function claimEvent(eventId: string): Promise<boolean> {
 }
 
 // --- Claude breakdown (translate-brian, distilled) ---------------------------
-
-const anthropic = new Anthropic()
 
 const INTAKE_SYSTEM = `ROLE
 You decompose raw pasted material into structured work items for Nico's Brain Inbox.
@@ -171,6 +218,7 @@ export async function generateBreakdown(
     user += `\n\nPREVIOUS BREAKDOWN (JSON):\n${JSON.stringify(edit.prev)}\n\nNICO'S EDIT NOTE (apply it and return the FULL corrected JSON):\n${edit.note}`
   }
   try {
+    const anthropic = new Anthropic() // per-call: never break module load if key is absent
     const resp = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 3000,
@@ -181,7 +229,7 @@ export async function generateBreakdown(
     const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
     return sanitizeBreakdown(JSON.parse(jsonText) as IntakeBreakdown)
   } catch (err) {
-    console.error('intake breakdown failed:', err)
+    await logDebug('breakdown', err)
     return null
   }
 }
@@ -255,14 +303,21 @@ function newId(): string {
   return `bi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 }
 
+// Self-serve binding: DM from an unbound/unexpected user → tell them their ID.
+export async function handleUnbound(channel: string, userId: string): Promise<void> {
+  await say(channel, SUBMITTER_ID
+    ? `Este intake está configurado para otro usuario. Tu Slack user ID: \`${userId}\` — si eres Nico en un workspace nuevo, actualiza \`INTAKE_SUBMITTER_ID\` en Vercel (builder-bot) y redeploya.`
+    : `⚙️ Intake sin configurar. Tu Slack user ID es \`${userId}\` — ponlo como \`INTAKE_SUBMITTER_ID\` en Vercel (builder-bot → Settings → Environment Variables) y redeploya. Después pégame material y arranco.`)
+}
+
 export async function handleNewPaste(channel: string, text: string): Promise<void> {
   if (text.trim().length < 15) {
-    await postMessage(channel, 'Pégame algo con más carne (mensaje de Brian, notas, transcript…) y lo desmenuzo en items para Brain Inbox. `help` para ver comandos.')
+    await say(channel, 'Pégame algo con más carne (mensaje de Brian, notas, transcript…) y lo desmenuzo en items para Brain Inbox. `help` para ver comandos.')
     return
   }
   const breakdown = await generateBreakdown(text)
   if (!breakdown) {
-    await postMessage(channel, '⚠️ No pude estructurar eso (fallo del parser). Reintenta o reformula el paste.')
+    await say(channel, '⚠️ No pude estructurar eso (fallo del modelo/parser). Reintenta o reformula el paste.')
     return
   }
   const p: IntakeProposal = {
@@ -271,39 +326,39 @@ export async function handleNewPaste(channel: string, text: string): Promise<voi
   }
   await saveProposal(p)
   await setLatestDraftId(SUBMITTER_ID, p.id)
-  await postMessage(channel, formatDraft(p))
+  await say(channel, formatDraft(p))
 }
 
 export async function handleOk(channel: string): Promise<void> {
   const id = await getLatestDraftId(SUBMITTER_ID)
   const p = id ? await getProposal(id) : null
   if (!p || p.status !== 'draft') {
-    await postMessage(channel, 'No hay ningún desmenuce en borrador. Pégame material primero.')
+    await say(channel, 'No hay ningún desmenuce en borrador. Pégame material primero.')
     return
   }
-  const msg = await postAndGetMsg(APPROVER_ID, formatApproval(p))
+  const msg = await sayAndGetMsg(APPROVER_ID, formatApproval(p))
   p.status = 'awaiting_approval'
   p.approvalMsg = msg
   await saveProposal(p)
   await setMsgRef(msg.channel, msg.ts, p.id)
-  await postMessage(channel, `📨 Enviado a aprobación${IS_TRIAL ? ' (🧪 trial: te llegó a ti mismo)' : ' de Brian'} — \`${p.id}\`. Con su ✅ los items caen en Brain Inbox.`)
+  await say(channel, `📨 Enviado a aprobación${IS_TRIAL ? ' (🧪 trial: te llegó a ti mismo)' : ' de Brian'} — \`${p.id}\`. Con su ✅ los items caen en Brain Inbox.`)
 }
 
 export async function handleEdit(channel: string, note: string): Promise<void> {
   const id = await getLatestDraftId(SUBMITTER_ID)
   const p = id ? await getProposal(id) : null
   if (!p || p.status !== 'draft') {
-    await postMessage(channel, 'No hay borrador que editar. Pégame material primero.')
+    await say(channel, 'No hay borrador que editar. Pégame material primero.')
     return
   }
   const breakdown = await generateBreakdown(p.raw, { prev: p.breakdown, note })
   if (!breakdown) {
-    await postMessage(channel, '⚠️ El edit falló (parser). El borrador anterior sigue vivo — reintenta.')
+    await say(channel, '⚠️ El edit falló (modelo/parser). El borrador anterior sigue vivo — reintenta.')
     return
   }
   p.breakdown = breakdown
   await saveProposal(p)
-  await postMessage(channel, formatDraft(p))
+  await say(channel, formatDraft(p))
 }
 
 export async function handleSkip(channel: string): Promise<void> {
@@ -314,14 +369,14 @@ export async function handleSkip(channel: string): Promise<void> {
     await saveProposal(p)
   }
   await setLatestDraftId(SUBMITTER_ID, null)
-  await postMessage(channel, '🗑️ Borrador descartado.')
+  await say(channel, '🗑️ Borrador descartado.')
 }
 
 export async function handleStatus(channel: string): Promise<void> {
   const id = await getLatestDraftId(SUBMITTER_ID)
   const p = id ? await getProposal(id) : null
   if (!p) {
-    await postMessage(channel, 'Sin intake activo. Pégame material y arranco.')
+    await say(channel, 'Sin intake activo. Pégame material y arranco.')
     return
   }
   const labels: Record<IntakeStatus, string> = {
@@ -331,11 +386,11 @@ export async function handleStatus(channel: string): Promise<void> {
     rejected: '❌ rechazado',
     discarded: '🗑️ descartado',
   }
-  await postMessage(channel, `\`${p.id}\` (${p.breakdown.items.length} items) → ${labels[p.status]}`)
+  await say(channel, `\`${p.id}\` (${p.breakdown.items.length} items) → ${labels[p.status]}`)
 }
 
 export async function handleHelp(channel: string): Promise<void> {
-  await postMessage(channel, [
+  await say(channel, [
     '*Brain Intake* — pégame material crudo (burst de Brian, notas, transcript) y lo convierto en items estructurados.',
     '`ok` → mandar el borrador a aprobación · `edit <nota>` → rehacer con tu nota · `skip` → descartar · `status` → estado del último intake',
     `Aprobador actual: ${IS_TRIAL ? '🧪 TRIAL (tú mismo)' : '<@' + APPROVER_ID + '>'} — su ✅ en el mensaje de aprobación manda todo a Brain Inbox.`,
@@ -348,8 +403,8 @@ export async function finalizeApproval(proposalId: string, approve: boolean): Pr
   if (!approve) {
     p.status = 'rejected'
     await saveProposal(p)
-    if (p.approvalMsg) await updateMessage(p.approvalMsg.channel, p.approvalMsg.ts, formatApproval(p) + '\n\n❌ *Rejected.*')
-    await postMessage(SUBMITTER_ID, `❌ \`${p.id}\` rechazado${IS_TRIAL ? ' (trial)' : ' por Brian'}. Ajusta y re-mándalo si aplica.`)
+    if (p.approvalMsg) await editMsg(p.approvalMsg.channel, p.approvalMsg.ts, formatApproval(p) + '\n\n❌ *Rejected.*')
+    await say(SUBMITTER_ID, `❌ \`${p.id}\` rechazado${IS_TRIAL ? ' (trial)' : ' por Brian'}. Ajusta y re-mándalo si aplica.`)
     await setLatestDraftId(SUBMITTER_ID, null)
     return
   }
@@ -369,8 +424,8 @@ export async function finalizeApproval(proposalId: string, approve: boolean): Pr
     `✅ *Approved — ${results.length}/${p.breakdown.items.length} logged to Brain Inbox*${results.length ? `: ${results.join(', ')}` : ''}`,
     failures.length ? `⚠️ Failed: ${failures.join(' · ')}` : '',
   ].filter(Boolean).join('\n')
-  if (p.approvalMsg) await updateMessage(p.approvalMsg.channel, p.approvalMsg.ts, formatApproval(p) + '\n\n' + outcome)
-  await postMessage(SUBMITTER_ID, `${IS_TRIAL ? '🧪 ' : ''}✅ \`${p.id}\` aprobado — ${results.length}/${p.breakdown.items.length} tasks en Brain Inbox${results.length ? `: ${results.join(', ')}` : ''}${failures.length ? `\n⚠️ Fallaron: ${failures.join(' · ')}` : ''}`)
+  if (p.approvalMsg) await editMsg(p.approvalMsg.channel, p.approvalMsg.ts, formatApproval(p) + '\n\n' + outcome)
+  await say(SUBMITTER_ID, `${IS_TRIAL ? '🧪 ' : ''}✅ \`${p.id}\` aprobado — ${results.length}/${p.breakdown.items.length} tasks en Brain Inbox${results.length ? `: ${results.join(', ')}` : ''}${failures.length ? `\n⚠️ Fallaron: ${failures.join(' · ')}` : ''}`)
   await setLatestDraftId(SUBMITTER_ID, null)
 }
 
