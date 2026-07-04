@@ -189,3 +189,17 @@ npx vercel curl "/api/weekly?test=true&dry_run=true&lookback_days=7" \
 | `lib/kv.ts` | `bow_*` wrappers |
 | `lib/types.ts` | `reactions` on `SlackMessage`; `BuilderScore`, `RecentWinner`, `BowPin` |
 | `vercel.json` | +weekly cron |
+
+---
+
+## 2026-07-04 · Brain Intake (NUEVO) — Slack DM → Claude → approval → Brain Inbox
+
+Pipeline nuevo en `/api/intake` (commits `e6b0851` + `0edf62e`). Nico pega material crudo al bot **Brain Intake** (app separada en el workspace **Humble Conviction** — NO este bot de TNB), Claude lo desmenuza (prompt destilado de translate-brian), Nico revisa (`ok`/`edit`/`skip`), el aprobador reacciona ✅ y los items caen al Brain Inbox de Nico. Setup completo + manifest + env table: **INTAKE-SETUP.md**.
+
+- **Estado:** deployado en prod (builder-bot-nine.vercel.app), E2E validado (state machine, DMs, ✅→Brain Inbox `#97-gsk`/`#84-a9t`, idempotencia). Inerte para Slack hasta que Nico cree la app HC (5 min, manifest listo).
+- **🧪 TRIAL:** `INTAKE_APPROVER_ID` unset ⇒ approvals van al propio Nico. Live = setearlo al ID de Brian en HC **después de su OK** (draft del one-tap abajo).
+- **⛔ BLOCKER GLOBAL:** la cuenta Anthropic de la key de este proyecto está sin créditos → `messages.create` da 400. Eso bloquea el breakdown del intake **y el recap diario de este bot** (el cron corre y avanza cursores pero el LLM falla; ver KV `intake_debug_last`). Task urgente `#84-a9t` en Brain Inbox.
+- Aisladísimo de los crons: credenciales propias `INTAKE_SLACK_*`, `lib/slack.ts` sin tocar.
+
+**Draft one-tap para Brian (go-live del approver, mandar por el DM de HC):**
+> Quick one — new pipeline, needs your one-tap. When you brain-dump ideas/instructions to Nico, an AI intake now turns them into clean work items. Before anything lands on Nico's task list, YOU get a 5-line summary in this DM — react ✅ to approve, ❌ to kill, or reply with tweaks. ~10 seconds per batch, and you control what enters the pipeline. It's been running in test mode and works. Turn it on?
