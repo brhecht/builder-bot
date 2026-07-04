@@ -177,3 +177,23 @@ export async function getReplyAuthors(channelId: string, parentTs: string): Prom
     return []
   }
 }
+
+// Like postAndGetTs, but also returns the resolved channel id. Needed by the
+// intake flow: posting to a USER id (DM) resolves to a D… channel, and the
+// later reaction_added event carries that D… id — we must store what Slack
+// resolved, not what we sent.
+export async function postAndGetMsg(channelOrUserId: string, text: string): Promise<{ channel: string; ts: string }> {
+  const data = await slackPost('chat.postMessage', {
+    channel: channelOrUserId,
+    text,
+    username: 'Builder Bot',
+    icon_emoji: ':hammer_and_wrench:',
+    unfurl_links: false,
+    unfurl_media: false,
+  })
+  return { channel: data.channel as string, ts: data.ts as string }
+}
+
+export async function updateMessage(channelId: string, ts: string, text: string): Promise<void> {
+  await slackPost('chat.update', { channel: channelId, ts, text })
+}
