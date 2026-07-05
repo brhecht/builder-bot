@@ -203,3 +203,12 @@ Pipeline nuevo en `/api/intake` (commits `e6b0851` + `0edf62e`). Nico pega mater
 
 **Draft one-tap para Brian (go-live del approver, mandar por el DM de HC):**
 > Quick one — new pipeline, needs your one-tap. When you brain-dump ideas/instructions to Nico, an AI intake now turns them into clean work items. Before anything lands on Nico's task list, YOU get a 5-line summary in this DM — react ✅ to approve, ❌ to kill, or reply with tweaks. ~10 seconds per batch, and you control what enters the pipeline. It's been running in test mode and works. Turn it on?
+
+### 2026-07-05 · Brain Intake — red-team + expert hardening pass (commit af1e108)
+
+3 auditorías adversariales (seguridad / races / resiliencia) + research de best practices (Slack Events, Anthropic SDK) → 18 hallazgos verificados corregidos. 35 assertions verdes (firma+gate unit, state machine live, clasificador). Lo clave:
+- **CRÍTICO cerrado:** el bypass `?test=true` está desactivado en producción (gate `VERCEL_ENV`). Antes saltaba firma+dedupe y dejaba `ev.user` bajo control del atacante → con el `CRON_SECRET` (que viaja en la query → logs) se podía impersonar al aprobador e inyectar tasks. Verificado denegado en prod en vivo (503).
+- **Sin doble-logueo:** lock atómico (Redis SET NX) → dos ✅ simultáneas loguean cada task una vez.
+- **Fallo parcial recuperable:** estado `partial` + re-✅ reintenta solo los faltantes; nunca re-loguea.
+- **Anti-outage-silencioso:** output estructurado por tool-use forzado (no fence-strip) + taxonomía de errores → "sin créditos (402)" / auth / overload / truncado, cada uno con mensaje propio en vez del "reformula" que enmascaró el recap muerto. Health hace ping a KV + reporta `ready`.
+- **Testing cambió:** con el bypass off en prod, simular con curl va contra **preview o local** (`VERCEL_ENV≠production`). Ver INTAKE-SETUP.md §Debug.

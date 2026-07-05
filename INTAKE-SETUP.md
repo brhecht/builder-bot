@@ -68,6 +68,16 @@
 
 ## Debug
 
-- Health: `GET https://builder-bot-nine.vercel.app/api/intake` (muestra qué está configurado, modo trial y workspace).
+- Health: `GET https://builder-bot-nine.vercel.app/api/intake` → `ready` (todo configurado + KV vivo), `testModeEnabled`, `trial`, `workspace`, y flags de config por dependencia (incl. `kv` pingeado en vivo). Si `ready:false`, mira qué flag está en false.
 - Último error runtime sin entrar a logs: key `intake_debug_last` en el KV (Upstash) del proyecto.
-- Simular eventos sin Slack: `POST /api/intake?test=true&secret=<CRON_SECRET>` con el JSON del evento (misma convención test del repo).
+- **El bypass `?test=true` está DESACTIVADO en producción** (endurecimiento de seguridad — ver abajo). Para simular eventos con curl, hazlo contra un **preview deploy** o `next dev` local (ahí `VERCEL_ENV ≠ production` habilita el test flag). En prod, un `test=true` forjado se rechaza (401/503).
+
+## Endurecimiento (red team + expert, 2026-07-05)
+
+Este endpoint pasó por 3 auditorías adversariales + research de best practices (Slack Events API, Anthropic SDK). Lo relevante para operarlo:
+
+- **Seguridad:** el bypass de test es inerte en producción. La verificación de firma HMAC (ventana 5 min, constant-time, fail-closed) protege el path real. La autorización descansa en la firma de Slack → en prod nadie puede impersonar al aprobador.
+- **Sin doble-logueo:** dos reacciones ✅ simultáneas (ej. ✅+👍) loguean cada task una sola vez (lock atómico en KV).
+- **Fallo parcial recuperable:** si Brain Inbox falla a mitad, el estado queda `partial` y **reaccionar ✅ otra vez reintenta SOLO los que faltan** (nunca re-loguea los que ya entraron). `status` en el DM te dice el conteo.
+- **Nada falla en silencio:** cada causa de error da un mensaje distinto y accionable — sin créditos Anthropic (HTTP 402), auth inválida, sobrecarga, rate-limit, output truncado, o "sin items accionables". El genérico "reformula" ya no enmascara la causa real (que fue lo que mató el recap diario).
+- **Salud honesta:** `ready:false` mientras falte conectar la app de Slack (signing secret). Cuando esté todo, `ready:true`.
