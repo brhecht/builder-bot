@@ -4,20 +4,21 @@
 // (Nico DMs the bot), reaction_added (approver reacts on an approval message).
 //
 // Security: every non-test request must carry a valid Slack signature
-// (HMAC-SHA256 with SLACK_SIGNING_SECRET over `v0:{ts}:{rawBody}`). The
-// `?test=true&secret=CRON_SECRET` bypass mirrors the repo's existing test
-// convention (commit bf42b2d) and lets us simulate events with curl before
-// the Slack app is wired up.
+// (HMAC-SHA256 with the signing secret over `v0:{ts}:{rawBody}`, 5-min replay
+// window). The `?test=true&secret=<CRON_SECRET>` bypass is for curl-simulating
+// events during development — it is HARD-DISABLED in production (VERCEL_ENV),
+// because in test mode `ev.user` is attacker-controlled and would let anyone
+// who learned the shared CRON_SECRET impersonate the approver. Never in prod.
 //
 // Slack requires a 200 within 3s; Claude takes longer — so we ack immediately
-// and do the work in waitUntil(). Slack retries deliveries (x-slack-retry-num);
-// claimEvent() dedupes by event_id so retries are no-ops.
+// and do the work in waitUntil(). Slack retries deliveries (0/+1min/+5min);
+// claimEvent() dedupes by event_id (600s window covers all retries).
 
 import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { waitUntil } from '@vercel/functions'
 import {
-  SUBMITTER_ID, APPROVER_ID, claimEvent, getMsgRef, reactionKind, logDebug,
+  SUBMITTER_ID, APPROVER_ID, claimEvent, getMsgRef, reactionKind, logDebug, kvHealth,
   handleNewPaste, handleOk, handleEdit, handleSkip, handleStatus, handleHelp, handleUnbound, finalizeApproval,
 } from '@/lib/intake'
 
@@ -36,11 +37,19 @@ interface SlackEvent {
   item?: { type: string; channel: string; ts: string }
 }
 
+// Constant-time string compare that never throws on length mismatch.
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a), bb = Buffer.from(b)
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb)
+}
+
 function verifySignature(raw: string, ts: string | null, sig: string | null, secret: string): boolean {
   if (!ts || !sig) return false
-  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false // replay guard
+  const tsNum = Number(ts)
+  if (!Number.isFinite(tsNum)) return false // malformed ts must fail closed (no replay bypass)
+  if (Math.abs(Date.now() / 1000 - tsNum) > 300) return false // 5-min replay window
   const expected = 'v0=' + crypto.createHmac('sha256', secret).update(`v0:${ts}:${raw}`).digest('hex')
-  return expected.length === sig.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))
+  return safeEqual(expected, sig)
 }
 
 export async function POST(req: NextRequest) {
@@ -53,19 +62,21 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'invalid json' }, { status: 400 })
   }
 
-  // Setup handshake — echo the challenge. Harmless, and lets the URL verify
-  // in the Slack UI even if env ordering isn't perfect yet.
+  // Setup handshake — echo the challenge so the URL verifies in the Slack UI.
   if (payload.type === 'url_verification') {
     return NextResponse.json({ challenge: payload.challenge })
   }
 
+  // Test bypass: dev/preview ONLY. Hard-off in production regardless of secret.
   const url = new URL(req.url)
-  const isTest = url.searchParams.get('test') === 'true' && !!process.env.CRON_SECRET &&
-    url.searchParams.get('secret') === process.env.CRON_SECRET
+  const isTest = process.env.VERCEL_ENV !== 'production' &&
+    url.searchParams.get('test') === 'true' &&
+    !!process.env.CRON_SECRET &&
+    safeEqual(url.searchParams.get('secret') || '', process.env.CRON_SECRET)
 
   if (!isTest) {
-    // The intake flow lives in the HC workspace via its own Slack app — its
-    // signing secret is INTAKE_SLACK_SIGNING_SECRET (shared var as fallback).
+    // Intake lives in the HC workspace via its own Slack app — its signing
+    // secret is INTAKE_SLACK_SIGNING_SECRET (shared var as fallback).
     const secret = process.env.INTAKE_SLACK_SIGNING_SECRET || process.env.SLACK_SIGNING_SECRET
     if (!secret) return NextResponse.json({ error: 'INTAKE_SLACK_SIGNING_SECRET not configured' }, { status: 503 })
     const ok = verifySignature(raw, req.headers.get('x-slack-request-timestamp'), req.headers.get('x-slack-signature'), secret)
@@ -118,18 +129,26 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({ ok: true, ignored: ev.type })
 }
 
-// Health check — lets Nico (and Vercel) confirm the route is deployed.
+// Health check — confirms the route is deployed AND its dependencies are live
+// (KV is pinged, not just assumed — a dead KV used to fail totally silent).
 export async function GET() {
+  const kv = await kvHealth()
+  const configured = {
+    submitter: !!SUBMITTER_ID,
+    signingSecret: !!(process.env.INTAKE_SLACK_SIGNING_SECRET || process.env.SLACK_SIGNING_SECRET),
+    slackToken: !!(process.env.INTAKE_SLACK_BOT_TOKEN || process.env.SLACK_BOT_TOKEN),
+    anthropicKey: !!process.env.ANTHROPIC_API_KEY,
+    brainKey: !!process.env.BRAIN_INBOX_API_KEY,
+    kv,
+  }
+  const ready = configured.signingSecret && configured.slackToken && configured.anthropicKey && configured.brainKey && kv
   return NextResponse.json({
     ok: true,
     feature: 'brain-intake',
     workspace: process.env.INTAKE_SLACK_BOT_TOKEN ? 'hc (own app)' : 'fallback (shared TNB token)',
+    testModeEnabled: process.env.VERCEL_ENV !== 'production',
     trial: APPROVER_ID === SUBMITTER_ID,
-    configured: {
-      submitter: !!SUBMITTER_ID,
-      signingSecret: !!(process.env.INTAKE_SLACK_SIGNING_SECRET || process.env.SLACK_SIGNING_SECRET),
-      anthropicKey: !!process.env.ANTHROPIC_API_KEY,
-      brainKey: !!process.env.BRAIN_INBOX_API_KEY,
-    },
+    ready,
+    configured,
   })
 }
