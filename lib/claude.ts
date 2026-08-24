@@ -518,7 +518,7 @@ VOICE
 
 INPUT
 You get the winner's display name, the text of their standout post, the engagement
-numbers (reactions + replies that week), and the week label.
+that post drew, whether it was the highest in the community, and the week label.
 
 OUTPUT — return ONLY the Slack message text (Slack mrkdwn), no preamble, no code
 fence, no JSON. Constraints:
@@ -526,9 +526,15 @@ fence, no JSON. Constraints:
 - Name the winner. Refer to their standout post in one specific sentence drawing
   on its actual content (paraphrase — do not quote it back verbatim or include
   the raw post).
-- One short line on why it resonated (the engagement it drew), stated naturally
-  ("…and the room showed up for it" rather than reciting raw counts robotically;
-  you MAY mention the numbers once).
+- One short line on why it resonated, stated naturally ("…and the room showed up
+  for it" rather than reciting raw counts robotically; you MAY mention the
+  numbers once).
+- HARD RULE on engagement. Only claim the post drew the most engagement, moved
+  the needle most, or led the community when the input says "highest in the
+  community: yes". When it says no, do not claim it, do not imply it, and do not
+  turn the absence of reactions into a virtue ("quiet but it landed hardest" is
+  the same false claim in a nicer coat). Write about what the post said instead.
+  When the counts are zero, say nothing about engagement at all.
 - 4–7 short lines total. Glanceable in under 20 seconds. No markdown headings
   beyond the bold lines. Do NOT invent facts not present in the input.
 - Slack mrkdwn only: *bold* with single asterisks, _italics_ with underscores.
@@ -541,6 +547,10 @@ export interface BuilderOfWeekInput {
   topPostLink: string
   totalReactions: number
   totalReplies: number
+  // True only when this winner also topped the weekly board AND their post drew
+  // real engagement. Gates every "most engagement in the community" claim — on
+  // Aug 21 the copy made that claim over a post with zero of both.
+  isTopEngagement: boolean
   weekLabel: string // human-friendly, e.g. "week of Jun 2"
 }
 
@@ -549,12 +559,18 @@ function fallbackBowMessage(input: BuilderOfWeekInput): string {
   const postLine = input.topPostLink
     ? `Their standout: <${input.topPostLink}|this post>.`
     : 'Thanks for showing up and building in the open.'
+  const engagement = input.totalReactions + input.totalReplies
+  const engagementLine = input.isTopEngagement
+    ? `It drew the most engagement in the community — ${input.totalReactions} reactions and ${input.totalReplies} replies.`
+    : engagement > 0
+    ? `It drew ${input.totalReactions} reactions and ${input.totalReplies} replies.`
+    : null
   return [
     '*🏆 Builder of the Week*',
     '',
     `Hi friends: this week's Builder of the Week is *${input.name}*.`,
     postLine,
-    `It drew the most engagement in the community — ${input.totalReactions} reactions and ${input.totalReplies} replies.`,
+    ...(engagementLine ? [engagementLine] : []),
     '',
     'Keep building. Stay Humble!',
   ].join('\n')
@@ -565,7 +581,8 @@ export async function generateBuilderOfWeek(input: BuilderOfWeekInput): Promise<
 
 Winner display name: ${input.name}
 Week: ${input.weekLabel}
-Engagement this week: ${input.totalReactions} reactions, ${input.totalReplies} replies (highest in the community)
+Engagement on their standout post: ${input.totalReactions} reactions, ${input.totalReplies} replies
+Highest in the community: ${input.isTopEngagement ? 'yes' : 'no'}
 Their standout post text:
 """
 ${input.topPostText.slice(0, 1200)}

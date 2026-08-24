@@ -12,6 +12,10 @@ export interface SlackMessage {
   type?: string
   subtype?: string
   reply_count?: number
+  // Set by Slack on anything posted through a bot token. Builder Bot's own
+  // posts land in #general (the weekly BOW + leaderboard), so the daily recap
+  // has to drop them or it cites itself.
+  bot_id?: string
   attachments?: SlackAttachment[]
   // Present on the conversations.history payload when a message has reactions
   // (requires the reactions:read scope). Used by the weekly Builder of the Week
@@ -78,6 +82,8 @@ export interface BuilderTopPost {
   channelName: string
   reactions: number
   replies: number
+  // Engagement received on this post (reactions*2 + replies*3). Used only to
+  // pick which of an author's posts is the standout — not added to any total.
   score: number
 }
 

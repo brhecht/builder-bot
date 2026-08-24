@@ -18,9 +18,18 @@ import {
   unpinMessage,
   makeDeepLink,
   getReplyAuthors,
+  isBotAuthored,
 } from '@/lib/slack'
 import { generateBuilderOfWeek } from '@/lib/claude'
 import { BuilderScore, BuilderTopPost, RecentWinner, AllTimeEntry } from '@/lib/types'
+import {
+  POINTS,
+  COOLDOWN_WEEKS,
+  TOP_N,
+  formatLeaderboard,
+  pickBowSkipReason,
+  buildBowNote,
+} from '@/lib/leaderboard'
 
 export const maxDuration = 60
 
@@ -36,18 +45,7 @@ const CHANNEL_NAMES: Record<string, string> = {
   [process.env.SLACK_CHANNEL_GENERAL ?? '']: 'general',
 }
 
-// Leaderboard point weights (tunable).
-// score = posts*POST + reactionsReceived*REACTION_RECEIVED + reactionsGiven*REACTION_GIVEN + repliesWritten*REPLY_WRITTEN
-const POINTS = {
-  POST: 5,
-  REACTION_RECEIVED: 2,
-  REACTION_GIVEN: 1,
-  REPLY_WRITTEN: 3,
-} as const
-
-const COOLDOWN_WEEKS = 4            // BOW winner no-repeat window
 const MAX_REPLY_THREADS = 30        // max threads to fetch reply-authors from (per channel)
-const TOP_N = 5                     // leaderboard positions shown in Friday post
 
 function log(msg: string) {
   console.log(`[builder-bot:weekly] ${msg}`)
@@ -67,42 +65,6 @@ function getExcludeIds(): Set<string> {
       .map((s) => s.trim())
       .filter(Boolean)
   )
-}
-
-// Deterministic leaderboard post — no Claude call needed.
-function formatLeaderboard(
-  weeklyRanked: BuilderScore[],
-  allTime: AllTimeEntry[],
-  weekLabel: string,
-): string {
-  const medals = ['🥇', '🥈', '🥉']
-  const topN = weeklyRanked.slice(0, TOP_N)
-
-  const lines: string[] = [`*📊 Community Leaderboard — ${weekLabel}*`, '']
-
-  for (let i = 0; i < topN.length; i++) {
-    const b = topN[i]
-    const prefix = i < 3 ? medals[i] : `${i + 1}.`
-    lines.push(`${prefix} *${b.userName}* — ${b.score} Tendys 🐓`)
-    if (i === 0) {
-      lines.push(
-        `   _${b.posts} post${b.posts !== 1 ? 's' : ''} · ${b.reactionsReceived} rxn received · ${b.reactionsGiven} rxn given · ${b.repliesWritten} replies_`,
-      )
-    }
-  }
-
-  const topAllTime = [...allTime].sort((a, b) => b.totalPts - a.totalPts).slice(0, 3)
-  if (topAllTime.length > 0) {
-    lines.push('')
-    lines.push(`*All-time:* ${topAllTime.map((e) => `${e.name} (${e.totalPts} 🐓)`).join(' · ')}`)
-  }
-
-  lines.push('')
-  lines.push(
-    `_Scoring: post +${POINTS.POST} · rxn received +${POINTS.REACTION_RECEIVED} · rxn given +${POINTS.REACTION_GIVEN} · reply +${POINTS.REPLY_WRITTEN} Tendys 🐓_`,
-  )
-
-  return lines.join('\n')
 }
 
 // Upsert a member's weekly points into the all-time map.
@@ -205,7 +167,7 @@ export async function GET(req: NextRequest) {
     let threadCount = 0
     for (const msg of r.value) {
       const userId = msg.user
-      if (!userId || msg.subtype === 'bot_message') continue
+      if (!userId || isBotAuthored(msg)) continue
 
       const reactions = (msg.reactions ?? []).reduce((sum, rx) => sum + (rx.count ?? 0), 0)
       const replyCount = msg.reply_count ?? 0
@@ -214,6 +176,13 @@ export async function GET(req: NextRequest) {
       if (!excludeIds.has(userId)) {
         const postPts = POINTS.POST + reactions * POINTS.REACTION_RECEIVED
 
+        // Which of an author's posts is "the standout" is ranked on engagement
+        // received, replies included. Ranking on postPts alone made every
+        // zero-reaction post tie at 5 and handed the slot to whichever came
+        // first, which is how a post with nothing on it got written up as the
+        // one that moved the needle most (Aug 21).
+        const postEngagement = reactions * POINTS.REACTION_RECEIVED + replyCount * POINTS.REPLY_WRITTEN
+
         const topPost: BuilderTopPost = {
           ts: msg.ts,
           permalink: makeDeepLink(channelId, msg.ts),
@@ -221,7 +190,7 @@ export async function GET(req: NextRequest) {
           channelName: name,
           reactions,
           replies: replyCount,
-          score: postPts,
+          score: postEngagement,
         }
 
         const existing = agg.get(userId)
@@ -246,7 +215,7 @@ export async function GET(req: NextRequest) {
           existing.totalReplies += replyCount
           existing.postCount += 1
           existing.score += postPts
-          if (postPts > existing.topPost.score) existing.topPost = topPost
+          if (postEngagement > existing.topPost.score) existing.topPost = topPost
         }
       }
 
@@ -333,6 +302,11 @@ export async function GET(req: NextRequest) {
   const bowEligible = weeklyRanked.filter((b) => !cooldownIds.has(b.userId) && b.posts > 0)
   const winner = bowEligible[0]
 
+  // Why the top scorer was passed over, if they were. This is the reconcile
+  // half of the Aug 21 defect: the rule existed, it was just never stated.
+  const topScorer = weeklyRanked[0]
+  const skipReason = pickBowSkipReason(topScorer, winner, cooldownIds)
+
   if (!winner) {
     log('Skipping — no eligible builder with engagement this week')
     if (!isTest && !channelOverride) await setBowLastWeek(currentWeek)
@@ -345,7 +319,11 @@ export async function GET(req: NextRequest) {
   }
 
   // ── 5. Resolve display names (top N + winner, batched) ──────────────────────
-  const usersToResolve = new Set([winner.userId, ...weeklyRanked.slice(0, TOP_N).map((b) => b.userId)])
+  const usersToResolve = new Set([
+    winner.userId,
+    ...(topScorer ? [topScorer.userId] : []),
+    ...weeklyRanked.slice(0, TOP_N).map((b) => b.userId),
+  ])
   await Promise.all(
     Array.from(usersToResolve).map(async (uid) => {
       const name = await getUserName(uid)
@@ -360,7 +338,9 @@ export async function GET(req: NextRequest) {
       status: 'dry_run',
       week: currentWeek,
       window_days: lookbackDays,
-      winner: { name: winner.userName, score: winner.score },
+      winner: { name: winner.userName, score: winner.score, rank: weeklyRanked.findIndex((b) => b.userId === winner.userId) + 1 },
+      top_scorer: topScorer ? { name: topScorer.userName || topScorer.userId, score: topScorer.score } : null,
+      bow_skip_reason: skipReason,
       weekly_leaderboard: weeklyRanked.slice(0, TOP_N).map((b, i) => ({
         rank: i + 1,
         name: b.userName || b.userId,
@@ -385,17 +365,29 @@ export async function GET(req: NextRequest) {
   const updatedAllTime = Array.from(allTimeMap.values())
 
   // ── 8. Generate BOW announcement (Claude, Brian's voice) ─────────────────────
+  // isTopEngagement gates the "most engagement in the community" claim. On Aug 21
+  // the winner's standout post had zero reactions and zero replies and the copy
+  // still said it moved the needle most. It now only says that when it is true.
+  const winnerPostReactions = winner.topPost.reactions
+  const winnerPostReplies = winner.topPost.replies
+  const isTopEngagement =
+    !!topScorer &&
+    topScorer.userId === winner.userId &&
+    winnerPostReactions + winnerPostReplies > 0
+
   const bowMessage = await generateBuilderOfWeek({
     name: winner.userName,
     topPostText: winner.topPost.text,
     topPostLink: winner.topPost.permalink,
-    totalReactions: winner.totalReactions,
-    totalReplies: winner.totalReplies,
+    totalReactions: winnerPostReactions,
+    totalReplies: winnerPostReplies,
+    isTopEngagement,
     weekLabel,
   })
 
   // ── 9. Format leaderboard post (deterministic) ───────────────────────────────
-  const leaderboardMessage = formatLeaderboard(weeklyRanked, updatedAllTime, weekLabel)
+  const bowNote = buildBowNote(skipReason, topScorer)
+  const leaderboardMessage = formatLeaderboard(weeklyRanked, updatedAllTime, weekLabel, winner.userId, bowNote)
 
   // ── 10. Resolve posting targets ──────────────────────────────────────────────
   const bowTargets = getBowTargets()
@@ -469,6 +461,7 @@ export async function GET(req: NextRequest) {
     week: currentWeek,
     winner: winner.userName,
     score: winner.score,
+    bow_skip_reason: skipReason,
     targets,
     pinned,
     mode: isProduction ? 'production' : 'trial',

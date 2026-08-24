@@ -49,7 +49,22 @@ async function joinChannel(channelId: string): Promise<void> {
   await slackPost('conversations.join', { channel: channelId })
 }
 
-export async function getChannelMessages(channelId: string, oldest: number): Promise<SlackMessage[]> {
+// True for anything Builder Bot or any other app posted. conversations.history
+// stamps bot_id on those, and chat.postMessage with a custom username also sets
+// subtype 'bot_message'. Either marker is enough to disqualify a message from
+// being quoted back as community conversation.
+export function isBotAuthored(m: SlackMessage): boolean {
+  return !!m.bot_id || m.subtype === 'bot_message'
+}
+
+// `latest` bounds the window on the right. Without it Slack returns everything
+// up to the moment of the call, which is how the 9 AM run kept picking up posts
+// made at 8:55 that same morning.
+export async function getChannelMessages(
+  channelId: string,
+  oldest: number,
+  latest?: number,
+): Promise<SlackMessage[]> {
   const messages: SlackMessage[] = []
   let cursor: string | undefined
   let joined = false
@@ -59,6 +74,10 @@ export async function getChannelMessages(channelId: string, oldest: number): Pro
       channel: channelId,
       oldest: oldest.toString(),
       limit: '200',
+    }
+    if (latest !== undefined) {
+      params.latest = latest.toString()
+      params.inclusive = 'false'
     }
     if (cursor) params.next_cursor = cursor
 

@@ -15,6 +15,7 @@ import {
   getUserName,
   postMessage,
   makeDeepLink,
+  isBotAuthored,
 } from '@/lib/slack'
 import { generateRecap, lastLLMOutput } from '@/lib/claude'
 import { fetchUrlContent, extractFirstUrl } from '@/lib/url-fetch'
@@ -22,6 +23,18 @@ import { ConversationCandidate, IntroCandidate, PendingIntro } from '@/lib/types
 
 // maxDuration for App Router route handlers
 export const maxDuration = 60
+
+// The recap covers whole days that have already ended. If a run is missed the
+// next one carries the gap, but never more than this many days — a long outage
+// should not dump a week into one post.
+const MAX_CATCHUP_DAYS = 3
+
+// The bar for calling a thread "top". A post with nothing on it yet is not a
+// top conversation, which is how a post made that same morning ended up in the
+// recap (Chuck, Aug 21). Either condition qualifies. Env-tunable so the floor
+// can move without a deploy.
+const MIN_REPLIES_FOR_TOP = Number(process.env.BB_MIN_REPLIES ?? 1)
+const MIN_REACTIONS_FOR_TOP = Number(process.env.BB_MIN_REACTIONS ?? 2)
 
 const CHANNELS = {
   INTRODUCE_YOURSELF: process.env.SLACK_CHANNEL_INTRODUCE_YOURSELF!,
@@ -106,17 +119,36 @@ export async function GET(req: NextRequest) {
   const lastReported: Record<string, number> = {}
   allChannels.forEach((ch, i) => { lastReported[ch] = lastTimestamps[i] })
 
-  // Test-only override: force a wider lookback window
+  // 1b. Window: whole days that have already ended, right edge at today 00:00.
+  // Slack now gets an explicit `latest`, so the 9 AM run can no longer pick up a
+  // post made at 8:55 that same morning. The left edge is wherever the last run
+  // stopped, so Monday still carries Saturday and Sunday rather than dropping
+  // them, capped at MAX_CATCHUP_DAYS.
+  const windowEndDt = now.startOf('day')
+  const dayStartDt = windowEndDt.minus({ days: 1 })
+  const catchupFloorDt = windowEndDt.minus({ days: MAX_CATCHUP_DAYS })
+  const windowEnd = Math.floor(windowEndDt.toSeconds())
+  const dayStart = Math.floor(dayStartDt.toSeconds())
+  const catchupFloor = Math.floor(catchupFloorDt.toSeconds())
+
+  const windowStart: Record<string, number> = {}
+  for (const ch of allChannels) {
+    windowStart[ch] = Math.max(catchupFloor, Math.min(lastReported[ch], dayStart))
+  }
+
+  // Test-only override: force a wider lookback and open the right edge
+  let latestArg: number | undefined = windowEnd
   if (lookbackHours && lookbackHours > 0) {
     const overrideTs = Math.floor(Date.now() / 1000) - lookbackHours * 3600
-    for (const ch of allChannels) lastReported[ch] = overrideTs
-    log(`Test mode — lookback overridden to ${lookbackHours}h ago`)
+    for (const ch of allChannels) windowStart[ch] = overrideTs
+    latestArg = undefined
+    log(`Test mode — lookback overridden to ${lookbackHours}h ago, right edge open`)
   }
 
   // 2. Fetch messages from all channels concurrently
   const [introResult, ...convResults] = await Promise.allSettled([
-    getChannelMessages(CHANNELS.INTRODUCE_YOURSELF, lastReported[CHANNELS.INTRODUCE_YOURSELF]),
-    ...convChannels.map((ch) => getChannelMessages(ch, lastReported[ch])),
+    getChannelMessages(CHANNELS.INTRODUCE_YOURSELF, windowStart[CHANNELS.INTRODUCE_YOURSELF], latestArg),
+    ...convChannels.map((ch) => getChannelMessages(ch, windowStart[ch], latestArg)),
   ])
 
   // 3. Build intro candidates with author + permalink. v2 prompt enforces the
@@ -133,6 +165,7 @@ export async function GET(req: NextRequest) {
   const introSeen = new Set<string>() // dedup key: `${user_id}:${ts}`
   if (introResult.status === 'fulfilled') {
     for (const msg of introResult.value) {
+      if (isBotAuthored(msg)) continue
       if (msg.text && msg.text.length >= 80) {
         const userId = msg.user ?? msg.username ?? 'unknown'
         const userName = await getUserName(userId)
@@ -205,6 +238,8 @@ export async function GET(req: NextRequest) {
   // 4. Build conversation candidates with URL dedup + replier display names
   const urlMap = new Map<string, { candidate: ConversationCandidate; score: number }>()
   const noUrlCandidates: ConversationCandidate[] = []
+  let droppedBotAuthored = 0
+  let droppedNoEngagement = 0
 
   for (let i = 0; i < convChannels.length; i++) {
     const channelId = convChannels[i]
@@ -217,7 +252,16 @@ export async function GET(req: NextRequest) {
     }
 
     for (const msg of result.value) {
+      if (isBotAuthored(msg)) { droppedBotAuthored++; continue }
       if (!msg.text || msg.text.trim().length < 30) continue
+
+      // Engagement floor. Nothing on it yet is not a top conversation.
+      const reactionCount = (msg.reactions ?? []).reduce((sum, rx) => sum + (rx.count ?? 0), 0)
+      const replyCountRaw = msg.reply_count ?? 0
+      if (replyCountRaw < MIN_REPLIES_FOR_TOP && reactionCount < MIN_REACTIONS_FOR_TOP) {
+        droppedNoEngagement++
+        continue
+      }
 
       const replies = msg.reply_count && msg.reply_count > 0
         ? await getThreadReplies(channelId, msg.ts)
@@ -288,12 +332,25 @@ export async function GET(req: NextRequest) {
 
   log(`${allCandidates.length} conversation candidates, ${introCandidates.length} intro candidates`)
 
-  const nowTs = Math.floor(Date.now() / 1000)
   const todayStr = now.toISODate()!
-  const dateStr = now.toFormat('ccc LLL d') // e.g. "Tue May 5" — matches v2 prompt sample
 
+  // Header names the days actually covered, so the reader can tell at a glance
+  // what the post is about: "Thursday 8/20", or "Fri 8/21 – Sun 8/23" after a gap.
+  const coveredStartDt = DateTime.fromSeconds(
+    Math.min(...allChannels.map((ch) => windowStart[ch])),
+    { zone: 'America/Bogota' },
+  ).startOf('day')
+  const coveredDays = Math.max(1, Math.round(windowEndDt.diff(coveredStartDt, 'days').days))
+  const dateStr = coveredDays <= 1
+    ? dayStartDt.toFormat('cccc M/d')
+    : `${coveredStartDt.toFormat('ccc M/d')} – ${dayStartDt.toFormat('ccc M/d')}`
+
+  log(`Window: ${dateStr} (${coveredDays} day${coveredDays !== 1 ? 's' : ''}), dropped ${droppedBotAuthored} bot-authored, ${droppedNoEngagement} below the engagement floor`)
+
+  // Mark the window as covered up to its right edge, not up to now — otherwise
+  // the next run's left edge swallows part of today.
   const updateTimestamps = () =>
-    Promise.all(allChannels.map((ch) => setLastReported(ch, nowTs)))
+    Promise.all(allChannels.map((ch) => setLastReported(ch, windowEnd)))
 
   // 5. Carry forward intros that pre-date today (kept as PendingIntro for the
   //    legacy KV format). We surface their raw text + permalink to the LLM.
@@ -322,7 +379,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       status: 'skipped',
       reason: 'no-new-info',
+      window: dateStr,
       dropped_dupes: droppedConvDupes + droppedIntroDupes,
+      dropped_bot_authored: droppedBotAuthored,
+      dropped_no_engagement: droppedNoEngagement,
     })
   }
 
@@ -372,6 +432,9 @@ export async function GET(req: NextRequest) {
       candidates: allCandidates.length,
       intros: allIntros.length,
       date: dateStr,
+      window_days: coveredDays,
+      dropped_bot_authored: droppedBotAuthored,
+      dropped_no_engagement: droppedNoEngagement,
       preview: post,
       // Diagnostic: list each candidate so we can verify what the LLM
       // received and which intros it dropped (welcomes vs. self-intros).
