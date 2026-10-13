@@ -1,4 +1,4 @@
-import { SlackMessage, SlackReply } from './types'
+import { SlackMessage, SlackReply, SlackUser } from './types'
 
 const SLACK_BASE = 'https://slack.com/api'
 
@@ -195,4 +195,47 @@ export async function getReplyAuthors(channelId: string, parentTs: string): Prom
   } catch {
     return []
   }
+}
+
+// --- Referrer intro DM (TNB-633) ---
+
+// Fresh user object, or null if Slack does not know the ID. Never cached: the
+// referrer DM depends on is_invited_user and deleted being current.
+export async function getUserInfo(userId: string): Promise<SlackUser | null> {
+  try {
+    const data = await slackGet('users.info', { user: userId })
+    return (data.user as SlackUser) ?? null
+  } catch (err) {
+    console.log(`[builder-bot] users.info ${userId}: ${err instanceof Error ? err.message : String(err)}`)
+    return null
+  }
+}
+
+// Needs the users:read.email scope. Without it Slack answers missing_scope
+// and this returns null, so the caller falls back to name matching.
+export async function lookupUserByEmail(email: string): Promise<SlackUser | null> {
+  try {
+    const data = await slackGet('users.lookupByEmail', { email })
+    return (data.user as SlackUser) ?? null
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!msg.includes('users_not_found')) console.log(`[builder-bot] users.lookupByEmail: ${msg}`)
+    return null
+  }
+}
+
+// Every user in the workspace, paginated (Slack's request param is `cursor`).
+// Capped at 20 pages of 200 so a cursor bug can never loop forever.
+export async function listUsers(): Promise<SlackUser[]> {
+  const users: SlackUser[] = []
+  let cursor: string | undefined
+  for (let page = 0; page < 20; page++) {
+    const params: Record<string, string> = { limit: '200' }
+    if (cursor) params.cursor = cursor
+    const data = await slackGet('users.list', params)
+    users.push(...((data.members as SlackUser[]) ?? []))
+    cursor = (data.response_metadata as Record<string, string> | undefined)?.next_cursor || undefined
+    if (!cursor) break
+  }
+  return users
 }

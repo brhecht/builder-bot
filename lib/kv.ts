@@ -83,3 +83,36 @@ export async function getAllTimeLeaderboard(): Promise<AllTimeEntry[]> {
 export async function setAllTimeLeaderboard(entries: AllTimeEntry[]): Promise<void> {
   await redis.set('leaderboard_alltime', entries)
 }
+
+// --- Referrer intro DM (TNB-633) ---
+
+// Slack retries event deliveries. First writer wins; the 600s window covers
+// Slack's 0 / +1 min / +5 min retry schedule.
+export async function claimTnbEvent(eventId: string): Promise<boolean> {
+  return (await redis.set(`tnb_evt_${eventId}`, 1, { nx: true, ex: 600 })) === 'OK'
+}
+
+// One referrer DM per joiner, ever. Claimed right before the send, released
+// only if the send fails, so a team_join and a user_change for the same person
+// can never both DM the referrer.
+export async function claimReferrerDm(userId: string): Promise<boolean> {
+  return (await redis.set(`referrer_dm_${userId}`, new Date().toISOString(), { nx: true })) === 'OK'
+}
+
+export async function releaseReferrerDm(userId: string): Promise<void> {
+  await redis.del(`referrer_dm_${userId}`)
+}
+
+// A team_join that arrived while the invite was still pending. The user_change
+// that clears is_invited_user completes the join. 90-day TTL.
+export async function markPendingJoin(userId: string): Promise<void> {
+  await redis.set(`pending_join_${userId}`, new Date().toISOString(), { ex: 60 * 60 * 24 * 90 })
+}
+
+export async function isPendingJoin(userId: string): Promise<boolean> {
+  return (await redis.get(`pending_join_${userId}`)) !== null
+}
+
+export async function clearPendingJoin(userId: string): Promise<void> {
+  await redis.del(`pending_join_${userId}`)
+}

@@ -212,3 +212,36 @@ Pipeline nuevo en `/api/intake` (commits `e6b0851` + `0edf62e`). Nico pega mater
 - **Fallo parcial recuperable:** estado `partial` + re-✅ reintenta solo los faltantes; nunca re-loguea.
 - **Anti-outage-silencioso:** output estructurado por tool-use forzado (no fence-strip) + taxonomía de errores → "sin créditos (402)" / auth / overload / truncado, cada uno con mensaje propio en vez del "reformula" que enmascaró el recap muerto. Health hace ping a KV + reporta `ready`.
 - **Testing cambió:** con el bypass off en prod, simular con curl va contra **preview o local** (`VERCEL_ENV≠production`). Ver INTAKE-SETUP.md §Debug.
+
+---
+
+## 2026-10-13 · Referrer intro DM (TNB-633), behind a flag, OFF
+
+When a referred member really joins the TNB Slack, Builder Bot DMs the referrer and asks them to post the intro in #introduce-yourself, then comments on the person's TNB CRM card. Brian approved it on the Oct 13 call.
+
+- **Flag:** `REFERRER_DM_ENABLED`. Unset = off (default). `dry_run` = every lookup runs and the DM text goes to the logs, nothing is sent or written. `true` = live.
+- **Trigger:** Slack Events to `/api/slack/events`: `team_join`, plus `user_change` for users whose `team_join` came in while the invite was still pending. A user with `is_invited_user` is never a join.
+- **Lookup:** joiner's CRM card by Slack ID on the card, then Slack email, then exact full name as card title. "Referred by" line, first full name only. Referrer resolved through their own CRM card (Slack ID, then email), else a unique exact full-name match in Slack. Referrer must be signed in, not a guest, not deactivated.
+- **No DM when:** no card or two cards, card already at 5. Introduced or later, "Referred by" missing or not a person, referrer is Brian or in `REFERRER_DM_SKIP_IDS`, referrer not active in Slack. Each case logs one `referrer-dm skipped (<reason>)` line.
+- **Once per person:** KV `referrer_dm_<userId>` (SET NX), released only if the DM fails.
+- **Check without sending:** `GET /api/referrer-dm?user=<Slack ID>` with `Authorization: Bearer <CRON_SECRET>`. Always dry-run; its deps throw on any write.
+- **Tests:** `npx tsx scripts/verify-referrer-dm.ts` (19 checks, mocks only).
+
+### Setup before turning it on
+1. Brian, Builder Bot app (api.slack.com/apps): Event Subscriptions on, Request URL `https://<production domain>/api/slack/events`, bot events `team_join` and `user_change`. Optional scope `users:read.email` (matches by email; without it the bot matches by Slack ID and name). Reinstall if a scope was added.
+2. Vercel env (production): `TNB_SLACK_SIGNING_SECRET` (app's Signing Secret), `LINEAR_API_KEY`, `REFERRER_DM_SKIP_IDS` (Brian's TNB Slack ID), then `REFERRER_DM_ENABLED=dry_run`. Redeploy.
+3. Read the logs on the next real join. When the dry-run line names the right referrer, set `REFERRER_DM_ENABLED=true`.
+
+### Files
+| File | Change |
+|------|--------|
+| `lib/referrer-dm.ts` | **NEW** flow, parsing, copy (no I/O) |
+| `lib/referrer-dm-live.ts` | **NEW** real Slack/Linear/KV wiring, read-only variant |
+| `lib/linear.ts` | **NEW** CRM-only Linear client |
+| `lib/slack-signature.ts` | **NEW** Slack request signature check |
+| `app/api/slack/events/route.ts` | **NEW** TNB Slack Events endpoint |
+| `app/api/referrer-dm/route.ts` | **NEW** read-only check endpoint |
+| `lib/slack.ts` | `getUserInfo`, `lookupUserByEmail`, `listUsers` |
+| `lib/kv.ts` | event dedupe, DM claim, pending-join marker |
+| `lib/types.ts` | `SlackUser`, `CrmCard` |
+| `scripts/verify-referrer-dm.ts` | **NEW** mock tests |
