@@ -1,8 +1,9 @@
-// Minimal Linear GraphQL client for the referrer intro DM (TNB-633).
+// Minimal Linear GraphQL client for the referrer intro DM (TNB-633) and the
+// join mark (TNB-674).
 //
 // Scope is the TNB CRM team and nothing else: every read filters on the CRM
-// team key, and commentOnCrmCard re-reads the issue's team from Linear and
-// refuses anything outside it (never Athena, never The New Builder team).
+// team key, and every write re-reads the issue's team from Linear and refuses
+// anything outside it (never Athena, never The New Builder team).
 //
 // Auth: LINEAR_API_KEY, a Linear personal API key. Comments are posted as the
 // key's owner.
@@ -39,6 +40,7 @@ interface RawIssue {
   url: string
   team?: { key: string } | null
   state?: { name: string; type: string } | null
+  labels?: { nodes: { name: string }[] } | null
 }
 
 function toCard(n: RawIssue): CrmCard {
@@ -51,10 +53,11 @@ function toCard(n: RawIssue): CrmCard {
     teamKey: n.team?.key ?? '',
     stateName: n.state?.name ?? '',
     stateType: n.state?.type ?? '',
+    labels: (n.labels?.nodes ?? []).map((l) => l.name),
   }
 }
 
-const CARD_FIELDS = 'id identifier title description url team { key } state { name type }'
+const CARD_FIELDS = 'id identifier title description url team { key } state { name type } labels { nodes { name } }'
 
 async function findCrmCards(filter: Record<string, unknown>): Promise<CrmCard[]> {
   const key = crmTeamKey()
@@ -75,15 +78,54 @@ export function findCrmCardsByTitle(title: string): Promise<CrmCard[]> {
   return findCrmCards({ title: { eqIgnoreCase: title } })
 }
 
-export async function commentOnCrmCard(card: CrmCard, body: string): Promise<void> {
+// Re-reads the issue's team from Linear and refuses anything outside TNB CRM.
+async function assertCrmCard(card: CrmCard, action: string): Promise<string> {
   const key = crmTeamKey()
   const check = await linearGql<{ issue: { team: { key: string } } | null }>(
     'query CardTeam($id: String!) { issue(id: $id) { team { key } } }',
     { id: card.id },
   )
   if (check.issue?.team.key !== key) {
-    throw new Error(`refusing to comment on ${card.identifier}: not in the ${key} team`)
+    throw new Error(`refusing to ${action} ${card.identifier}: not in the ${key} team`)
   }
+  return key
+}
+
+// Adds a label and/or moves the card to a workflow state, both by name, both
+// resolved inside the CRM team. Used by the join mark (TNB-674).
+export async function markCrmCard(card: CrmCard, change: { addLabel?: string; moveToState?: string }): Promise<void> {
+  const key = await assertCrmCard(card, 'update')
+  const input: { stateId?: string; addedLabelIds?: string[] } = {}
+
+  if (change.addLabel) {
+    const data = await linearGql<{ issueLabels: { nodes: { id: string; name: string; team: { key: string } | null }[] } }>(
+      'query CrmLabel($name: String!) { issueLabels(filter: { name: { eqIgnoreCase: $name } }, first: 10) { nodes { id name team { key } } } }',
+      { name: change.addLabel },
+    )
+    const label = data.issueLabels.nodes.find((l) => l.team?.key === key) ?? data.issueLabels.nodes.find((l) => !l.team)
+    if (!label) throw new Error(`label "${change.addLabel}" not found for the ${key} team`)
+    input.addedLabelIds = [label.id]
+  }
+
+  if (change.moveToState) {
+    const data = await linearGql<{ workflowStates: { nodes: { id: string; name: string }[] } }>(
+      'query CrmState($key: String!, $name: String!) { workflowStates(filter: { team: { key: { eq: $key } }, name: { eq: $name } }, first: 2) { nodes { id name } } }',
+      { key, name: change.moveToState },
+    )
+    if (data.workflowStates.nodes.length !== 1) throw new Error(`state "${change.moveToState}" not found once in the ${key} team`)
+    input.stateId = data.workflowStates.nodes[0].id
+  }
+
+  if (!input.stateId && !input.addedLabelIds) return
+  const data = await linearGql<{ issueUpdate: { success: boolean } }>(
+    'mutation CrmMark($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
+    { id: card.id, input },
+  )
+  if (!data.issueUpdate.success) throw new Error('Linear issueUpdate returned success=false')
+}
+
+export async function commentOnCrmCard(card: CrmCard, body: string): Promise<void> {
+  await assertCrmCard(card, 'comment on')
   const data = await linearGql<{ commentCreate: { success: boolean } }>(
     'mutation CrmComment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }',
     { input: { issueId: card.id, body } },

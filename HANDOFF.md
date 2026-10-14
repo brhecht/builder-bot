@@ -245,3 +245,35 @@ When a referred member really joins the TNB Slack, Builder Bot DMs the referrer 
 | `lib/kv.ts` | event dedupe, DM claim, pending-join marker |
 | `lib/types.ts` | `SlackUser`, `CrmCard` |
 | `scripts/verify-referrer-dm.ts` | **NEW** mock tests |
+
+---
+
+## 2026-10-14 · Join mark (TNB-674), behind a flag, OFF
+
+When someone really joins the TNB Slack, Builder Bot marks their TNB CRM card: adds `TNB SLACK`, and moves a card still before stage 4 to `4. Accepted`, then comments on the card. Decided by Nico Oct 14: Builder Bot is the one join detector; Slack invites stay manual (Slack has no invite API outside the Enterprise plan), so TNB-654 (Grokbot) was canceled.
+
+- **Flag:** `JOIN_MARK_ENABLED`, separate from `REFERRER_DM_ENABLED`. Unset = off (default). `dry_run` = lookups run, the planned change is logged, nothing is written. `true` = live.
+- **Trigger:** the same `/api/slack/events` route and the same pending-invite handling as the referrer DM. The route now runs the join mark first, then the referrer DM. It acks and does nothing only when both flags are off.
+- **Card lookup:** the same as the referrer DM (Slack ID on the card, then Slack email, then exact full name). No card or two cards: no write.
+- **Never backwards:** cards at 4 or later, closed cards and statuses with no number (Deactivated account, In Review) keep their status; they only get the label if it is missing. A card that already has the label and needs no move gets no write and no comment.
+- **Linear writes:** `markCrmCard` in `lib/linear.ts` resolves the label and the status by name inside the CRM team and refuses any issue outside it.
+- **Check without writing:** `GET /api/referrer-dm?user=<Slack ID>` now also returns `joinMark` (always dry-run).
+- **Tests:** `npx tsx scripts/verify-join-mark.ts` (17 checks, mocks only). The referrer DM suite still passes (19 checks).
+
+### Setup before turning it on
+1. Same Slack app setup as the referrer DM (Oct 13 section, step 1): Event Subscriptions on, bot events `team_join` and `user_change`. Brian owns the app.
+2. Vercel env (production): `TNB_SLACK_SIGNING_SECRET`, `LINEAR_API_KEY` (shared with the referrer DM), then `JOIN_MARK_ENABLED=dry_run`. Redeploy.
+3. On the next real join, read the `join-mark dry_run` log line. When it names the right card and change, set `JOIN_MARK_ENABLED=true`.
+
+### Files
+| File | Change |
+|------|--------|
+| `lib/join-mark.ts` | **NEW** flow, plan, comment (no I/O) |
+| `scripts/verify-join-mark.ts` | **NEW** 17 checks against mocks |
+| `lib/linear.ts` | `markCrmCard` (label + status by name), card labels in reads, shared CRM team check |
+| `lib/referrer-dm.ts` | `findJoinerCard` exported for reuse |
+| `lib/referrer-dm-live.ts` | join mark config, live and read-only deps |
+| `app/api/slack/events/route.ts` | runs both features, pending handling covers both |
+| `app/api/referrer-dm/route.ts` | check endpoint returns the join mark dry-run too |
+| `lib/types.ts` | `CrmCard.labels` |
+| `.env.local.example` | `JOIN_MARK_ENABLED`, `JOIN_MARK_LABEL`, `JOIN_MARK_STATE` |

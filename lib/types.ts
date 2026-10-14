@@ -162,4 +162,5 @@ export interface CrmCard {
   teamKey: string
   stateName: string   // e.g. "4. Accepted"
   stateType: string   // Linear workflow state type: backlog, unstarted, started, completed, canceled
+  labels?: string[]   // label names, e.g. ["TNB MEMBERS", "TNB SLACK"]
 }

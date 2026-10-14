@@ -1,17 +1,20 @@
 // Slack Events endpoint for the TNB workspace (the Builder Bot app).
 //
-// One feature today: the referrer intro DM (TNB-633, lib/referrer-dm.ts).
+// Two features run on a real join, each behind its own flag:
+//   join mark          TNB SLACK + 4. Accepted on the CRM card (TNB-674, lib/join-mark.ts)
+//   referrer intro DM  the referrer posts the intro (TNB-633, lib/referrer-dm.ts)
 // Bot events it uses (both need users:read):
 //   team_join    a new member
 //   user_change  an invited member signs in (only for users seen as pending)
 //
 // A real join only. Slack creates the user when the invite is sent, so a user
 // with is_invited_user=true is not a join. If team_join arrives while the
-// invite is pending, the route stores a pending marker and the DM waits for
-// the user_change where the flag is gone. lib/referrer-dm.ts re-reads
-// users.info and checks again before any DM.
+// invite is pending, the route stores a pending marker and both features wait
+// for the user_change where the flag is gone. Each feature re-reads
+// users.info and checks again before any write.
 //
-// REFERRER_DM_ENABLED unset (the default) = this route acks and does nothing.
+// JOIN_MARK_ENABLED and REFERRER_DM_ENABLED both unset (the default) = this
+// route acks and does nothing.
 //
 // Security: Slack signature with TNB_SLACK_SIGNING_SECRET (the Builder Bot
 // app's signing secret, not the HC intake app's). No test bypass here; use
@@ -22,9 +25,10 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { waitUntil } from '@vercel/functions'
+import { getJoinMarkMode, handleJoinMark } from '@/lib/join-mark'
 import { claimTnbEvent, clearPendingJoin, isPendingJoin, markPendingJoin } from '@/lib/kv'
 import { getReferrerDmMode, handleConfirmedJoin } from '@/lib/referrer-dm'
-import { liveDeps, referrerDmConfig } from '@/lib/referrer-dm-live'
+import { joinMarkConfig, joinMarkLiveDeps, liveDeps, referrerDmConfig } from '@/lib/referrer-dm-live'
 import { verifySlackSignature } from '@/lib/slack-signature'
 
 export const dynamic = 'force-dynamic'
@@ -46,9 +50,17 @@ function log(msg: string) {
   console.log(`[builder-bot] ${msg}`)
 }
 
+// Runs every enabled feature for one user. Returns true while the invite is
+// still pending, so the caller can wait for the sign-in. The join mark runs
+// first: the DM skips cards at 5 or later, and the mark never moves past 4.
+async function runJoinFeatures(userId: string): Promise<boolean> {
+  const mark = await handleJoinMark(userId, joinMarkLiveDeps(), joinMarkConfig())
+  const dm = await handleConfirmedJoin(userId, liveDeps(), referrerDmConfig())
+  return mark.reason === 'joiner_invite_pending' || dm.reason === 'joiner_invite_pending'
+}
+
 async function onTeamJoin(userId: string): Promise<void> {
-  const result = await handleConfirmedJoin(userId, liveDeps(), referrerDmConfig())
-  if (result.reason === 'joiner_invite_pending') {
+  if (await runJoinFeatures(userId)) {
     await markPendingJoin(userId)
     log(`team_join ${userId}: invite still pending, waiting for sign-in`)
   }
@@ -57,8 +69,7 @@ async function onTeamJoin(userId: string): Promise<void> {
 async function onUserChange(user: EventUser): Promise<void> {
   if (!user.id || user.is_invited_user) return
   if (!(await isPendingJoin(user.id))) return // most user_change events: profile edits
-  const result = await handleConfirmedJoin(user.id, liveDeps(), referrerDmConfig())
-  if (result.reason !== 'joiner_invite_pending') await clearPendingJoin(user.id)
+  if (!(await runJoinFeatures(user.id))) await clearPendingJoin(user.id)
 }
 
 export async function POST(req: NextRequest) {
@@ -91,8 +102,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, ignored: payload.type })
   }
 
-  if (getReferrerDmMode() === 'off') {
-    return NextResponse.json({ ok: true, ignored: 'referrer_dm_off' })
+  if (getReferrerDmMode() === 'off' && getJoinMarkMode() === 'off') {
+    return NextResponse.json({ ok: true, ignored: 'join_features_off' })
   }
 
   if (payload.event_id && !(await claimTnbEvent(payload.event_id))) {

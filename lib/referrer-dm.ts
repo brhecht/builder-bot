@@ -178,12 +178,13 @@ export function buildCrmComment(referrerName: string, when: Date): string {
 // Lookups
 // ---------------------------------------------------------------------------
 
-type CardMatch = { card: CrmCard; via: string } | { error: 'no_crm_card' | 'ambiguous_crm_card'; via?: string }
+export type CardMatch = { card: CrmCard; via: string } | { error: 'no_crm_card' | 'ambiguous_crm_card'; via?: string }
+export type CardLookupDeps = Pick<ReferrerDmDeps, 'findCrmCardsByText' | 'findCrmCardsByTitle'>
 
 // Joiner -> CRM card. In order: Slack ID written on the card, Slack email,
 // exact full name as the card title. The first step that finds anything
-// decides; two cards at that step means no DM.
-async function findJoinerCard(joiner: SlackUser, deps: ReferrerDmDeps): Promise<CardMatch> {
+// decides; two cards at that step means no DM. Shared with the join mark.
+export async function findJoinerCard(joiner: SlackUser, deps: CardLookupDeps): Promise<CardMatch> {
   const byId = (await deps.findCrmCardsByText(joiner.id)).filter((c) => parseSlackIds(c.description).includes(joiner.id))
   if (byId.length === 1) return { card: byId[0], via: 'slack_id' }
   if (byId.length > 1) return { error: 'ambiguous_crm_card', via: 'slack_id' }
