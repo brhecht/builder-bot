@@ -127,3 +127,40 @@ export interface BowPin {
   channel: string
   ts: string
 }
+
+// --- Referrer intro DM (TNB-633) ---
+
+// The subset of Slack's user object the referrer DM reads. `is_invited_user`
+// is only present (and true) while an invite is pending: Slack creates the
+// account when the invite is sent, so that flag is what separates a real join
+// from a pending invite. `profile.email` needs the users:read.email scope.
+export interface SlackUser {
+  id: string
+  name?: string
+  real_name?: string
+  deleted?: boolean
+  is_bot?: boolean
+  is_app_user?: boolean
+  is_invited_user?: boolean
+  is_restricted?: boolean
+  is_ultra_restricted?: boolean
+  profile?: {
+    real_name?: string
+    display_name?: string
+    first_name?: string
+    email?: string
+  }
+}
+
+// One person's card in the Linear team "TNB CRM".
+export interface CrmCard {
+  id: string          // Linear issue UUID
+  identifier: string  // e.g. CRM-231
+  title: string       // the person's name
+  description: string
+  url: string
+  teamKey: string
+  stateName: string   // e.g. "4. Accepted"
+  stateType: string   // Linear workflow state type: backlog, unstarted, started, completed, canceled
+  labels?: string[]   // label names, e.g. ["TNB MEMBERS", "TNB SLACK"]
+}
