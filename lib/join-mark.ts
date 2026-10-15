@@ -13,7 +13,8 @@
 //
 // Flag: JOIN_MARK_ENABLED
 //   unset or any other value -> "off": nothing runs
-//   "dry_run"                -> every lookup runs, the planned change is logged, nothing is written
+//   "dry_run"                -> every lookup runs, the label and the status are resolved in
+//                               Linear (reads only), the planned change is logged, nothing is written
 //   "true"                   -> live: label, status, comment on the card
 //
 // No I/O of its own: Slack and Linear come in as deps, so the flow runs
@@ -39,6 +40,8 @@ export interface JoinMarkChange {
 
 export interface JoinMarkDeps extends CardLookupDeps {
   getUser(userId: string): Promise<SlackUser | null>
+  // Reads only: throws if the label or the status cannot be found in the CRM team.
+  checkMark(card: CrmCard, change: JoinMarkChange): Promise<void>
   markCard(card: CrmCard, change: JoinMarkChange): Promise<void>
   commentOnCrmCard(card: CrmCard, body: string): Promise<void>
   log(msg: string): void
@@ -101,7 +104,7 @@ export async function handleJoinMark(joinerId: string, deps: JoinMarkDeps, cfg: 
     const parts = [r.change?.addLabel && `label="${r.change.addLabel}"`, r.change?.moveToState && `move="${r.change.moveToState}"`]
       .filter(Boolean).join(' ')
     deps.log(`join-mark ${status}${reason ? ` (${reason})` : ''} joiner=${joinerId}` +
-      `${r.card ? ` card=${r.card}` : ''}${parts ? ` ${parts}` : ''}`)
+      `${r.card ? ` card=${r.card}` : ''}${parts ? ` ${parts}` : ''}${r.error ? ` error="${r.error}"` : ''}`)
     return r
   }
 
@@ -124,7 +127,15 @@ export async function handleJoinMark(joinerId: string, deps: JoinMarkDeps, cfg: 
   r.change = change
   r.comment = buildJoinMarkComment(change, deps.now())
 
-  if (cfg.mode === 'dry_run') return done('dry_run')
+  if (cfg.mode === 'dry_run') {
+    try {
+      await deps.checkMark(card, change)
+    } catch (err) {
+      r.error = err instanceof Error ? err.message : String(err)
+      return done('error', 'mark_check_failed')
+    }
+    return done('dry_run')
+  }
 
   try {
     await deps.markCard(card, change)

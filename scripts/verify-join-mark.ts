@@ -51,18 +51,29 @@ function makeDeps(world: World) {
   const marks: { card: string; change: JoinMarkChange }[] = []
   const comments: { card: string; body: string }[] = []
   const logs: string[] = []
+  const checks: { card: string; change: JoinMarkChange }[] = []
   let failMark = false
   let failComment = false
+  let failCheck = false
   const deps: JoinMarkDeps = {
     getUser: async (id) => world.users.find((u) => u.id === id) ?? null,
     findCrmCardsByText: async (t) => world.cards.filter((c) => c.description.toLowerCase().includes(t.toLowerCase())),
     findCrmCardsByTitle: async (t) => world.cards.filter((c) => c.title.toLowerCase() === t.toLowerCase()),
+    checkMark: async (c, change) => {
+      if (failCheck) throw new Error('label "TNB SLACK" not found for the CRM team')
+      checks.push({ card: c.identifier, change })
+    },
     markCard: async (c, change) => { if (failMark) throw new Error('state not found'); marks.push({ card: c.identifier, change }) },
     commentOnCrmCard: async (c, body) => { if (failComment) throw new Error('rate limited'); comments.push({ card: c.identifier, body }) },
     log: (m) => logs.push(m),
     now: () => new Date('2026-10-14T15:00:00Z'),
   }
-  return { deps, marks, comments, logs, failMarkNext: () => { failMark = true }, failCommentNext: () => { failComment = true } }
+  return {
+    deps, marks, comments, logs, checks,
+    failMarkNext: () => { failMark = true },
+    failCommentNext: () => { failComment = true },
+    failCheckNext: () => { failCheck = true },
+  }
 }
 const live: JoinMarkConfig = { mode: 'live', crmTeamKey: 'CRM', slackLabel: 'TNB SLACK', acceptedState: '4. Accepted' }
 
@@ -137,7 +148,43 @@ async function main() {
     assert.equal(r.status, 'dry_run')
     assert.deepEqual(r.change, { addLabel: 'TNB SLACK', moveToState: '4. Accepted' })
     assert.equal(w.marks.length + w.comments.length, 0)
+    assert.deepEqual(w.checks, [{ card: 'CRM-243', change: { addLabel: 'TNB SLACK', moveToState: '4. Accepted' } }])
     assert.ok(w.logs.some((l) => l.includes('join-mark dry_run') && l.includes('CRM-243')))
+  })
+
+  await test('dry_run: label or status missing in Linear is an error, still no write', async () => {
+    const w = makeDeps({ users: [kenan], cards: [KENAN_CARD] })
+    w.failCheckNext()
+    const r = await handleJoinMark(kenan.id, w.deps, { ...live, mode: 'dry_run' })
+    assert.equal(r.status, 'error')
+    assert.equal(r.reason, 'mark_check_failed')
+    assert.equal(w.marks.length + w.comments.length, 0)
+    assert.ok(w.logs.some((l) => l.includes('mark_check_failed') && l.includes('not found')))
+  })
+
+  await test('every stage before 4 moves; 4 and later, closed and unnumbered never move', () => {
+    for (const s of ['0. Identified', '1. Reached Out', '2. Invited', '3. Ping']) {
+      assert.equal(planJoinMark({ ...KENAN_CARD, stateName: s }, live).moveToState, '4. Accepted', s)
+    }
+    for (const [s, t] of [['4. Accepted', 'started'], ['5. Introduced', 'started'], ['6. Needs Attention', 'started'],
+      ['7. Active Member', 'completed'], ['No / Dropped', 'canceled'], ['In Review', 'started']]) {
+      assert.equal(planJoinMark({ ...KENAN_CARD, stateName: s, stateType: t }, live).moveToState, undefined, s)
+    }
+  })
+
+  await test('a Duplicate copy of the card does not make the match ambiguous', async () => {
+    const dup = { ...KENAN_CARD, id: 'uuid-CRM-300', identifier: 'CRM-300', stateName: 'Duplicate', stateType: 'duplicate' }
+    const w = makeDeps({ users: [kenan], cards: [dup, KENAN_CARD] })
+    const r = await handleJoinMark(kenan.id, w.deps, live)
+    assert.equal(r.status, 'marked')
+    assert.deepEqual(w.marks.map((m) => m.card), ['CRM-243'])
+  })
+
+  await test('only a Duplicate card: treated as no card', async () => {
+    const dup = { ...KENAN_CARD, stateName: 'Duplicate', stateType: 'duplicate' }
+    const w = makeDeps({ users: [kenan], cards: [dup] })
+    assert.equal((await handleJoinMark(kenan.id, w.deps, live)).reason, 'no_crm_card')
+    assert.equal(w.marks.length, 0)
   })
 
   await test('already marked: no write, no comment', async () => {
@@ -177,6 +224,7 @@ async function main() {
     assert.equal(r.status, 'error')
     assert.equal(r.reason, 'mark_failed')
     assert.equal(w.comments.length, 0)
+    assert.ok(w.logs.some((l) => l.includes('mark_failed') && l.includes('error="state not found"')))
   })
 
   await test('comment failure after the mark: still marked, logged', async () => {

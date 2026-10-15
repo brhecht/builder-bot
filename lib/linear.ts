@@ -91,11 +91,15 @@ async function assertCrmCard(card: CrmCard, action: string): Promise<string> {
   return key
 }
 
-// Adds a label and/or moves the card to a workflow state, both by name, both
-// resolved inside the CRM team. Used by the join mark (TNB-674).
-export async function markCrmCard(card: CrmCard, change: { addLabel?: string; moveToState?: string }): Promise<void> {
+type MarkChange = { addLabel?: string; moveToState?: string }
+type MarkInput = { stateId?: string; addedLabelIds?: string[] }
+
+// Resolves the label and the workflow state by name inside the CRM team,
+// from Linear's own lists (no hardcoded IDs). Reads only: the join mark's
+// dry run calls it so the log proves the live write would find both.
+export async function resolveCrmMark(card: CrmCard, change: MarkChange): Promise<MarkInput> {
   const key = await assertCrmCard(card, 'update')
-  const input: { stateId?: string; addedLabelIds?: string[] } = {}
+  const input: MarkInput = {}
 
   if (change.addLabel) {
     const data = await linearGql<{ issueLabels: { nodes: { id: string; name: string; team: { key: string } | null }[] } }>(
@@ -115,7 +119,13 @@ export async function markCrmCard(card: CrmCard, change: { addLabel?: string; mo
     if (data.workflowStates.nodes.length !== 1) throw new Error(`state "${change.moveToState}" not found once in the ${key} team`)
     input.stateId = data.workflowStates.nodes[0].id
   }
+  return input
+}
 
+// Adds a label and/or moves the card to a workflow state. Existing labels
+// stay (addedLabelIds only adds). Used by the join mark (TNB-674).
+export async function markCrmCard(card: CrmCard, change: MarkChange): Promise<void> {
+  const input = await resolveCrmMark(card, change)
   if (!input.stateId && !input.addedLabelIds) return
   const data = await linearGql<{ issueUpdate: { success: boolean } }>(
     'mutation CrmMark($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',

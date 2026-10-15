@@ -181,24 +181,33 @@ export function buildCrmComment(referrerName: string, when: Date): string {
 export type CardMatch = { card: CrmCard; via: string } | { error: 'no_crm_card' | 'ambiguous_crm_card'; via?: string }
 export type CardLookupDeps = Pick<ReferrerDmDeps, 'findCrmCardsByText' | 'findCrmCardsByTitle'>
 
+// A card closed as Duplicate is a copy of the person's real card. TNB CRM has
+// about twenty (Gilad Rotem, Paul Pierson, ...); counting them would turn the
+// real card into an "ambiguous" match.
+export function isDuplicateCard(card: CrmCard): boolean {
+  return card.stateType === 'duplicate' || /^\s*duplicate\s*$/i.test(card.stateName)
+}
+
 // Joiner -> CRM card. In order: Slack ID written on the card, Slack email,
 // exact full name as the card title. The first step that finds anything
-// decides; two cards at that step means no DM. Shared with the join mark.
+// decides; two cards at that step means no DM. Duplicate cards never count.
+// Shared with the join mark.
 export async function findJoinerCard(joiner: SlackUser, deps: CardLookupDeps): Promise<CardMatch> {
-  const byId = (await deps.findCrmCardsByText(joiner.id)).filter((c) => parseSlackIds(c.description).includes(joiner.id))
+  const live = async (p: Promise<CrmCard[]>) => (await p).filter((c) => !isDuplicateCard(c))
+  const byId = (await live(deps.findCrmCardsByText(joiner.id))).filter((c) => parseSlackIds(c.description).includes(joiner.id))
   if (byId.length === 1) return { card: byId[0], via: 'slack_id' }
   if (byId.length > 1) return { error: 'ambiguous_crm_card', via: 'slack_id' }
 
   const email = joiner.profile?.email?.toLowerCase()
   if (email) {
-    const byEmail = (await deps.findCrmCardsByText(email)).filter((c) => parseEmails(c.description).includes(email))
+    const byEmail = (await live(deps.findCrmCardsByText(email))).filter((c) => parseEmails(c.description).includes(email))
     if (byEmail.length === 1) return { card: byEmail[0], via: 'email' }
     if (byEmail.length > 1) return { error: 'ambiguous_crm_card', via: 'email' }
   }
 
   const name = cleanReferrerName(slackFullName(joiner))
   if (name) {
-    const byName = (await deps.findCrmCardsByTitle(name)).filter((c) => normalizeName(c.title) === normalizeName(name))
+    const byName = (await live(deps.findCrmCardsByTitle(name))).filter((c) => normalizeName(c.title) === normalizeName(name))
     if (byName.length === 1) return { card: byName[0], via: 'name' }
     if (byName.length > 1) return { error: 'ambiguous_crm_card', via: 'name' }
   }

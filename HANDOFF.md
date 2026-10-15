@@ -277,3 +277,27 @@ When someone really joins the TNB Slack, Builder Bot marks their TNB CRM card: a
 | `app/api/referrer-dm/route.ts` | check endpoint returns the join mark dry-run too |
 | `lib/types.ts` | `CrmCard.labels` |
 | `.env.local.example` | `JOIN_MARK_ENABLED`, `JOIN_MARK_LABEL`, `JOIN_MARK_STATE` |
+
+### 2026-10-15 · Join mark (TNB-674), review pass, still OFF
+
+Checked the Oct 14 code against Brian's rules and closed four gaps. No behavior change while `JOIN_MARK_ENABLED` is unset.
+
+- **Duplicate cards ignored.** TNB CRM has about 20 cards in `Duplicate` (Gilad Rotem, Paul Pierson, ...). The joiner lookup counted them, so a person with a duplicate card came back `ambiguous_crm_card` and got no mark and no DM. `findJoinerCard` now skips them (shared with the referrer DM).
+- **Dry run proves the write.** `dry_run` now resolves the `TNB SLACK` label and the `4. Accepted` status in the CRM team (reads only, `resolveCrmMark` in `lib/linear.ts`). If either is missing the log line says `join-mark error (mark_check_failed) ... error="..."` instead of a clean dry run.
+- **Errors in the log.** `join-mark error` lines now carry the error text. Before, a live `mark_failed` logged no reason.
+- **Features isolated.** In `/api/slack/events`, a failure in the join mark no longer stops the referrer DM, or the other way round. A run where either one failed keeps the `pending_join_<userId>` marker, so the next `user_change` for that person retries. Both are safe to re-run.
+- **Verified in Linear Oct 15:** team key `CRM`, label `TNB SLACK` (team label), status `4. Accepted` exists. Earlier stages: `0. Identified`, `1. Reached Out`, `2. Invited`, `3. Ping`.
+- **Tests:** `npx tsx scripts/verify-join-mark.ts` 21 checks. Referrer DM suite 19 checks. `tsc` and `next build` clean.
+
+**Known limits (not code):**
+- Matching by email needs the `users:read.email` scope on the Builder Bot app. Without it the lookup uses the Slack ID written on the card, then the exact name.
+- Invites sent before Event Subscriptions are on have no pending marker. If Slack fired their `team_join` at invite time, their acceptance is not caught. Mark those cards by hand, or check one with `GET /api/referrer-dm?user=<Slack ID>`.
+
+| File | Change |
+|------|--------|
+| `lib/referrer-dm.ts` | `isDuplicateCard`; `findJoinerCard` skips Duplicate cards |
+| `lib/linear.ts` | `resolveCrmMark` (reads only) split out of `markCrmCard` |
+| `lib/join-mark.ts` | `checkMark` dep, dry run calls it, error text in the log line |
+| `lib/referrer-dm-live.ts` | `checkMark` wired to `resolveCrmMark`, kept in the read-only deps |
+| `app/api/slack/events/route.ts` | each feature in its own try, retry on failure via the pending marker |
+| `scripts/verify-join-mark.ts` | 4 new checks, 2 extended |

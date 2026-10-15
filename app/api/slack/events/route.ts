@@ -10,8 +10,9 @@
 // A real join only. Slack creates the user when the invite is sent, so a user
 // with is_invited_user=true is not a join. If team_join arrives while the
 // invite is pending, the route stores a pending marker and both features wait
-// for the user_change where the flag is gone. Each feature re-reads
-// users.info and checks again before any write.
+// for the user_change where the flag is gone. A run where a feature failed
+// keeps the same marker, so the next user_change retries it. Each feature
+// re-reads users.info and checks again before any write.
 //
 // JOIN_MARK_ENABLED and REFERRER_DM_ENABLED both unset (the default) = this
 // route acks and does nothing.
@@ -50,26 +51,46 @@ function log(msg: string) {
   console.log(`[builder-bot] ${msg}`)
 }
 
-// Runs every enabled feature for one user. Returns true while the invite is
-// still pending, so the caller can wait for the sign-in. The join mark runs
-// first: the DM skips cards at 5 or later, and the mark never moves past 4.
-async function runJoinFeatures(userId: string): Promise<boolean> {
-  const mark = await handleJoinMark(userId, joinMarkLiveDeps(), joinMarkConfig())
-  const dm = await handleConfirmedJoin(userId, liveDeps(), referrerDmConfig())
-  return mark.reason === 'joiner_invite_pending' || dm.reason === 'joiner_invite_pending'
+interface JoinRun {
+  pending: boolean  // invite not accepted yet: wait for the sign-in
+  failed: boolean   // a feature threw or returned an error: retry on the next user_change
+}
+
+// Runs every enabled feature for one user. The join mark runs first: the DM
+// skips cards at 5 or later, and the mark never moves past 4. Each feature
+// runs on its own, so a failure in one never stops the other. Both are safe
+// to re-run: the mark skips a card that is already marked, the DM is claimed
+// once per joiner.
+async function runJoinFeatures(userId: string): Promise<JoinRun> {
+  const run: JoinRun = { pending: false, failed: false }
+  const one = async (name: string, fn: () => Promise<{ status: string; reason?: string }>) => {
+    try {
+      const r = await fn()
+      if (r.reason === 'joiner_invite_pending') run.pending = true
+      if (r.status === 'error') run.failed = true
+    } catch (err) {
+      run.failed = true
+      log(`${name} ${userId} failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  await one('join-mark', () => handleJoinMark(userId, joinMarkLiveDeps(), joinMarkConfig()))
+  await one('referrer-dm', () => handleConfirmedJoin(userId, liveDeps(), referrerDmConfig()))
+  return run
 }
 
 async function onTeamJoin(userId: string): Promise<void> {
-  if (await runJoinFeatures(userId)) {
+  const run = await runJoinFeatures(userId)
+  if (run.pending || run.failed) {
     await markPendingJoin(userId)
-    log(`team_join ${userId}: invite still pending, waiting for sign-in`)
+    log(`team_join ${userId}: ${run.pending ? 'invite still pending, waiting for sign-in' : 'failed, retry on the next user_change'}`)
   }
 }
 
 async function onUserChange(user: EventUser): Promise<void> {
   if (!user.id || user.is_invited_user) return
   if (!(await isPendingJoin(user.id))) return // most user_change events: profile edits
-  if (!(await runJoinFeatures(user.id))) await clearPendingJoin(user.id)
+  const run = await runJoinFeatures(user.id)
+  if (!run.pending && !run.failed) await clearPendingJoin(user.id)
 }
 
 export async function POST(req: NextRequest) {

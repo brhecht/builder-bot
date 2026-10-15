@@ -2,7 +2,7 @@
 
 import { getJoinMarkMode, JoinMarkConfig, JoinMarkDeps, JoinMarkMode } from './join-mark'
 import { claimReferrerDm, releaseReferrerDm } from './kv'
-import { commentOnCrmCard, crmTeamKey, findCrmCardsByText, findCrmCardsByTitle, markCrmCard } from './linear'
+import { commentOnCrmCard, crmTeamKey, findCrmCardsByText, findCrmCardsByTitle, markCrmCard, resolveCrmMark } from './linear'
 import { getReferrerDmMode, ReferrerDmConfig, ReferrerDmDeps, ReferrerDmMode } from './referrer-dm'
 import { getUserInfo, listUsers, lookupUserByEmail, postMessage } from './slack'
 
@@ -58,6 +58,7 @@ export function joinMarkLiveDeps(): JoinMarkDeps {
     getUser: getUserInfo,
     findCrmCardsByText,
     findCrmCardsByTitle,
+    checkMark: async (card, change) => { await resolveCrmMark(card, change) },
     markCard: markCrmCard,
     commentOnCrmCard,
     log: (msg) => console.log(`[builder-bot] ${msg}`),
@@ -65,6 +66,7 @@ export function joinMarkLiveDeps(): JoinMarkDeps {
   }
 }
 
+// checkMark stays: it only reads.
 export function joinMarkReadOnlyDeps(): JoinMarkDeps {
   return { ...joinMarkLiveDeps(), markCard: refuse, commentOnCrmCard: refuse }
 }
