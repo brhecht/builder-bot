@@ -7,7 +7,7 @@ description: "Send messages between Brian and Nico via Email, Slack DM, or Brain
 
 Route messages between Brian and Nico through the right channel. This skill works for **both users** — it detects who the current user is from the account email in the session context (the `userEmail` line Claude is given about the signed-in account), then routes to the other person accordingly.
 
-Three channels: Email (longer, structured — auto-sends within ~5 minutes), DM (short Slack direct message — sends immediately), and Ping (Brain Inbox / B Things Bot notification — sends immediately).
+Three channels: Email (longer, structured — auto-sends within ~5 minutes), DM (short Slack direct message — sends immediately), and Ping (Brain Inbox notification, posts via the "Nico Brain Inbox" Slack app — sends immediately).
 
 ## Rule 1: Send by default. The word "draft" means send.
 
@@ -58,7 +58,7 @@ Pick the channel based on what the user says, or infer from content length and i
 |--------|---------|
 | User says "email" | Email |
 | User says "DM" or "message" | DM |
-| User says "ping", "notify", "send to Brain Inbox", "send to B Things Bot" | Ping |
+| User says "ping", "notify", "send to Brain Inbox" | Ping |
 | Content is >500 chars or has structure (headers, lists, instructions) | Suggest Email |
 | Content is a quick status update, question, or "hey check this" | DM |
 | Content is task-oriented ("deploy is done", "PR is ready", "check this issue") | Ping |
@@ -139,34 +139,28 @@ Brian is non-technical — AI-conversant, but not an engineer. Any message to Br
 
 ## Channel: DM (Slack Direct Message)
 
-Send a short Slack DM via the Brain Inbox handoff-notify API with the `dmOnly` flag. This skips Brain Inbox / Firestore — it's just a direct Slack message.
+Send a short Slack DM **as the sender, from the sender's own Slack account**, through the Composio Slack connection (HC Community workspace). The message appears in the normal Brian <-> Nicolás DM conversation, exactly as if the sender typed it, with the `{Claude}` tag at the front.
 
-**Endpoint:** `https://brain-inbox-six.vercel.app/api/handoff-notify`
+Changed Oct 31, 2026. Until then DMs went through the Brain Inbox handoff-notify API with `dmOnly`, which posted as the "Nico Brain Inbox" app, not as the sender. Brian never saw those in his conversation with Nico. Do not use handoff-notify for DMs anymore; it is still the route for Pings.
 
-**Method:** POST with `Content-Type: text/plain` (avoids CORS preflight)
+**Steps:**
 
-**Body (JSON stringified):**
-```json
-{
-  "project": "<project name or 'Comms'>",
-  "summary": "{Claude} <the message content>",
-  "recipient": "<recipient email; for Nico use brainInboxEmail>",
-  "recipientSlackId": "<recipient slack ID>",
-  "dmOnly": true
-}
-```
+1. Call `COMPOSIO_SEARCH_TOOLS` with use case "send a direct message to a slack user" and `known_fields` set to the recipient's Slack ID (from the Contact Registry). Confirm the `slack` toolkit shows an ACTIVE connection whose `team` is **HC Community** (`T096WPV6QAD`) and whose `user_id` is the sender's own ID. If the active account is a different workspace, stop and apply Rule 2.
+2. Call `SLACK_OPEN_DM` with `users` set to the recipient's Slack ID. Use the returned `channel.id` (starts with `D`). `already_open=true` is success.
+3. Call `SLACK_SEND_MESSAGE` with `channel` set to that `D...` id and `text` set to `{Claude} <the message content>`.
+4. Confirm the response has `ok: true` and a `ts`. Tell the user: "DM sent to [name] on Slack."
 
-**`dmOnly` works (verified Oct 21, 2026).** The handler in `brain-inbox/api/handoff-notify.js` skips the Brain Inbox write and DMs the recipient's Slack ID directly. Read the response's `firestoreId`: `null` means nothing was written to Brain Inbox. Ignore `inboxWritten` in the response; it only says whether a user ID exists for the recipient, not whether a write happened (a known misleading field).
+**Character guidance:** Keep DMs under ~500 chars. If the content is longer, use email.
 
-**Character guidance:** Keep DMs under ~500 chars. If the content is longer, use email, or if email failed, apply Rule 2. The handoff-notify API truncates at 3000 chars for Slack.
+**If the Composio Slack tools are missing or the connection is not active:** apply Rule 2. The fallback that still delivers is the Ping channel (which posts via the Nico Brain Inbox app). Use it, keep the `{Claude}` tag, and say in the first line of your reply that the DM went out through Brain Inbox instead of as a normal message.
 
-**Execution:** Use the Network Resilience Protocol below. DMs send immediately with no approval step. Tell the user: "DM sent to [name] on Slack."
-
-## Channel: Ping (Brain Inbox / B Things Bot)
+## Channel: Ping (Brain Inbox)
 
 Send a task-oriented notification that lands in the recipient's triage queue. This is the standard handoff-notify path — writes to Firestore (if recipient has a UID) and posts to the appropriate Slack channel/DM.
 
-**Endpoint:** Same as DM but WITHOUT the `dmOnly` flag.
+**Endpoint:** `https://brain-inbox-six.vercel.app/api/handoff-notify`
+
+**Method:** POST with `Content-Type: text/plain` (avoids CORS preflight). Do NOT set `dmOnly`.
 
 **Body (JSON stringified):**
 ```json
@@ -184,9 +178,9 @@ Send a task-oriented notification that lands in the recipient's triage queue. Th
 
 **Execution:** Use the Network Resilience Protocol below. Pings send immediately with no approval step. Tell the user: "Pinged [name] via Brain Inbox."
 
-## Network Resilience Protocol (DM + Ping channels)
+## Network Resilience Protocol (Ping channel)
 
-The session's own workspace usually cannot reach arbitrary websites (outbound traffic goes through an allowlist), so a direct request from it often fails. Because the handoff-notify API must be reachable to send DMs and Pings, this skill uses a tiered fallback to ensure delivery regardless of network state.
+The session's own workspace usually cannot reach arbitrary websites (outbound traffic goes through an allowlist), so a direct request from it often fails. Because the handoff-notify API must be reachable to send Pings, this skill uses a tiered fallback to ensure delivery regardless of network state.
 
 **Try these in order. Move to the next tier only when the current one fails.**
 
@@ -206,7 +200,6 @@ fetch('https://brain-inbox-six.vercel.app/api/handoff-notify', {
     summary: '{Claude} <message>',
     recipient: '<email>',
     recipientSlackId: '<slackId>',
-    dmOnly: true  // omit for Ping channel
   })
 }).then(r => r.json()).then(d => JSON.stringify(d))
 ```
@@ -226,8 +219,7 @@ fetch('https://brain-inbox-six.vercel.app/api/handoff-notify', {
     project: '<project>',
     summary: '{Claude} <message>',
     recipient: '<email>',
-    recipientSlackId: '<slackId>',
-    dmOnly: true
+    recipientSlackId: '<slackId>'
   })
 }).then(r => r.text()).then(console.log).catch(e => { console.error(e.message); process.exit(1) })
 "
@@ -262,6 +254,7 @@ If the reference is ambiguous, ask the user to clarify what content they mean.
 Each user needs the following in their Cowork session for full functionality:
 
 1. **Gmail MCP connected** — required for email drafts. Each user connects their own Gmail account.
+1b. **Composio Slack connected to HC Community** — required for the DM channel. Each user connects their own Slack account (Brian's is connected as of Oct 23, 2026; Nico's is unverified).
 2. **Skill enabled on their Claude account** — skills sync to every session automatically; no file to install.
 3. **Signed in with a known email** — sender detection reads the signed-in account's email, so it must be one listed under Sender Detection.
 
